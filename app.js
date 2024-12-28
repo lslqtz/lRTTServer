@@ -7,7 +7,8 @@ const { URL } = require('url');
 const app = express();
 const port = 8082;
 
-let decoder = 'h264';
+let bitrate = '4567k';
+let decoder = '';
 let encoder = 'h264';
 let runtimeDir = process.cwd();
 let videoSegmentDuration = 5;
@@ -68,21 +69,21 @@ function detectHardwareAcceleration() {
 		const cmdDec = 'ffmpeg -hide_banner -hwaccels';
 		const decodersOutput = execSync(cmdDec, { encoding: 'utf-8' });
 		const availableDecoders = [
-			{ name: 'videotoolbox', codec: 'h264_videotoolbox', log: '检测到 Apple VideoToolbox 解码器支持.' },
-			{ name: 'cuda', codec: 'h264_cuvid', log: '检测到 NVIDIA CUDA 解码器支持.' },
-			{ name: 'qsv', codec: 'h264_qsv', log: '检测到 Intel QSV 解码器支持.' },
-			{ name: 'amf', codec: 'h264_amf', log: '检测到 AMD AMF 解码器支持.' },
+			{ name: 'videotoolbox', log: '检测到 Apple VideoToolbox 解码器支持.' },
+			{ name: 'cuda', log: '检测到 NVIDIA CUDA 解码器支持.' },
+			{ name: 'qsv', log: '检测到 Intel QSV 解码器支持.' },
+			{ name: 'amf', log: '检测到 AMD AMF 解码器支持.' },
 		];
 
 		for (const decoderInfo of availableDecoders) {
 			if (decodersOutput.includes(decoderInfo.name)) {
+				decoder = decoderInfo.name;
 				console.log(decoderInfo.log);
-				decoder = decoderInfo.codec;
 				break;
 			}
 		}
 
-		if (decoder === 'h264') {
+		if (decoder === '') {
 			console.log('未检测到硬件解码器, 使用默认的软件解码器.');
 		}
 
@@ -103,8 +104,8 @@ function detectHardwareAcceleration() {
 
 		for (const encoderInfo of availableEncoders) {
 			if (encodersOutput.includes(encoderInfo.name)) {
-				console.log(encoderInfo.log);
 				encoder = encoderInfo.name;
+				console.log(encoderInfo.log);
 				break;
 			}
 		}
@@ -135,7 +136,7 @@ function safeFilePath(baseDir, relativePath) {
 // 获取视频文件信息
 function getVideoInfo(videoPath) {
 	return new Promise((resolve, reject) => {
-		const cmd = `ffprobe -v error -show_entries stream=index,codec_type,duration -of csv=p=0 ${videoPath}`;
+		const cmd = `ffprobe -v error -show_entries format=duration -show_entries stream=index,codec_type,duration -of json ${videoPath}`;
 		exec(cmd, (err, stdout, stderr) => {
 			if (err) {
 				console.error(`无法获取视频信息: ${err.message}`);
@@ -143,51 +144,66 @@ function getVideoInfo(videoPath) {
 				return;
 			}
 
-			let duration = -1;
-			let hasAudio = 0;
-			const lines = stdout.trim().split('\n');
+			try {
+				const info = JSON.parse(stdout);
+				let duration = -1;
+				let hasAudio = 0;
+				let formatDuration = -1;
 
-			for (const line of lines) {
-				const parts = line.trim().split(',');
-				if (parts.length < 3) {
-					continue;
+				// 提取 format duration
+				if (info.format && info.format.duration) {
+					formatDuration = info.format.duration
 				}
-
-				const streamIndex = parts[0];
-				const codecType = parts[1];
-				const durationStr = parts[2];
-
-				if (streamIndex === "0" && codecType === "video") {
-					const parsedDuration = parseFloat(durationStr);
-					if (isNaN(parsedDuration)) {
-						duration = -1;
-						break;
-					} else {
-						duration = parsedDuration;
+				
+				// 提取 stream 信息
+				if (info.streams) {
+					for (const stream of info.streams) {
+						if (stream.index === 0 && stream.codec_type === "video" && stream.duration) {
+							duration = stream.duration
+						}
+						if (stream.index === 1 && stream.codec_type === "audio") {
+							hasAudio = 1;
+						}
 					}
 				}
 
-				if (streamIndex === "1" && codecType === "audio") {
-					hasAudio = 1;
+				// 使用 format duration 作为备选
+				if (duration === -1 && formatDuration !== -1) {
+					duration = formatDuration;
 				}
-			}
 
-			if (duration === -1) {
-				reject("无法获取视频长度.");
+				if (duration === -1) {
+					reject("无法获取视频长度.");
+					return;
+				}
+
+				resolve({ duration, hasAudio });
+			} catch (parseError) {
+				console.error("解析 JSON 出错:", parseError);
+				reject("解析视频信息出错, 见控制台日志.");
 				return;
 			}
-
-			resolve({ duration, hasAudio });
 		});
 	});
 }
+function roundDown(num, precision = 4) {
+	return (Math.floor(num * Math.pow(10, precision)) / Math.pow(10, precision));
+}
+
 // 生成 M3U8 播放列表
 function generatePlaylist(videoPath, duration, videoHasAudio) {
 	const encodedVideoPath = encodeURIComponent(videoPath);
 	const baseURL = `/video/rttSegment?path=${encodedVideoPath}&audio=${videoHasAudio}`;
 	let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${videoSegmentDurationStr}\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
-	for (let i = 0; i < duration; i++) {
-		playlist += `#EXTINF:${videoSegmentDurationStr}.0,\n${baseURL}&segment=${i}\n`;
+	let maxSegment = (duration / videoSegmentDuration);
+	let maxSegmentInt = Math.ceil(maxSegment);
+	let endDiffSecStr = String(roundDown((maxSegmentInt - maxSegment) * videoSegmentDuration));
+	for (let i = 0; i < maxSegmentInt; i++) {
+		if (maxSegmentInt === (i + 1)) {
+			playlist += `#EXTINF:${endDiffSecStr},\n${baseURL}&segment=${i}\n`;
+			break;
+		}
+		playlist += `#EXTINF:${videoSegmentDurationStr}.0000,\n${baseURL}&segment=${i}\n`;
 	}
 	playlist += "#EXT-X-ENDLIST\n";
 	return playlist;
@@ -202,26 +218,29 @@ function transcode(videoPath, startTime, videoHasAudio) {
 		}
 		currentTranscodingTasks++;
 
-		const startTimeStr = String(startTime / 2);
+		const delayTimeStr = String(roundDown(startTime / 2));
 		let args = [
-			'-ss', startTimeStr,
+			'-ss', startTime,
+			'-t', videoSegmentDurationStr,
 			'-accurate_seek',
 			'-i', videoPath,
-			'-ss', startTimeStr,
-			'-t', videoSegmentDurationStr,
 			'-map', '0:v:0',
 			'-c:v', encoder,
+			'-b:v', String(bitrate),
 			'-bsf:v', 'h264_mp4toannexb',
-			'-avoid_negative_ts', 'make_zero',
-			'-start_at_zero',
-			'-muxdelay', startTimeStr,
-			'-muxpreload', startTimeStr,
+			'-muxdelay', delayTimeStr,
+			'-muxpreload', delayTimeStr,
 			'-f', 'mpegts',
 			'pipe:1'
 		];
 
+		if (decoder !== '') {
+			args.unshift('-hwaccel', decoder);
+		}
+
 		if (videoHasAudio) {
-			args.splice(7, 0, '-map', '0:a:0',
+			args.splice(args.indexOf('-bsf:v') + 2, 0,
+				'-map', '0:a:0',
 				'-c:a', 'aac',
 				'-b:a', '256k'
 			);
@@ -278,7 +297,7 @@ app.get('/video/rttPlaylist', async (req, res) => {
 		}
 
 		const { duration, hasAudio } = await getVideoInfo(absPath)
-		const playlist = generatePlaylist(videoPath, Math.floor(duration), hasAudio);
+		const playlist = generatePlaylist(videoPath, duration, hasAudio);
 		res.set('Content-Type', 'application/vnd.apple.mpegurl');
 		res.send(playlist);
 	} catch (err) {
