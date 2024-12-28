@@ -8,14 +8,14 @@ const { URL } = require('url');
 const app = express();
 const port = 8082;
 
-let bitrate = '4567k';
-let decoder = '';
-let encoder = 'h264';
-let runtimeDir = process.cwd();
-
-// 最大同时转码任务数
+var bitrate = '4567k';
+var decoder = '';
+var encoder = 'h264';
+var runtimeDir = process.cwd();
+var subsetSubtitlesCache = {};
 const maxTranscodingTasks = 10;
-let currentTranscodingTasks = 0;
+
+var currentTranscodingTasks = 0;
 
 // 初始化运行时目录
 function init() {
@@ -116,11 +116,16 @@ function safeFilePath(baseDir, relativePath) {
 	}
 }
 
-function roundDown(num, precision = 3) {
+
+function round(num, precision = 4) {
+	return (Math.round(num * Math.pow(10, precision)) / Math.pow(10, precision));
+}
+
+function roundDown(num, precision = 4) {
 	return (Math.floor(num * Math.pow(10, precision)) / Math.pow(10, precision));
 }
 
-function roundUp(num, precision = 3) {
+function roundUp(num, precision = 4) {
 	return (Math.ceil(num * Math.pow(10, precision)) / Math.pow(10, precision));
 }
 
@@ -172,12 +177,19 @@ function getVideoInfo(videoPath) {
 					duration = formatDuration;
 				}
 
+				if (duration !== -1) {
+					duration = parseFloat(duration);
+					if (isNaN(duration)) {
+						duration = -1;
+					} else {
+						duration = round(duration);
+					}
+				}
+
 				if (duration === -1) {
 					reject("无法获取视频长度.");
 					return;
 				}
-
-				duration = roundDown(duration);
 
 				resolve({ duration, hasAudio, timeBase });
 			} catch (parseError) {
@@ -206,6 +218,39 @@ function getVideoKeyframesTimestamp(videoPath, timeBase) {
 	});
 }
 
+function readSubtitle(videoPath) {
+	return new Promise((resolve, reject) => {
+		// 获取视频文件所在的目录和文件名 (不带扩展名).
+		const videoDir = path.dirname(videoPath);
+		const videoName = path.basename(videoPath, path.extname(videoPath));
+		const videoExt = path.extname(videoPath);
+
+		let subtitleFileContent = null;
+
+		// 检查字幕文件是否存在.
+
+		fs.readFile(path.join(videoDir, `${videoName}.ass`), 'utf-8', function (err, data) {
+			if (!err) {
+				resolve({ videoName, data });
+				return;
+			}
+			fs.readFile(path.join(videoDir, `${videoName}${videoExt}.ass`), 'utf-8', function (err, data) {
+				if (!err) {
+					resolve({ videoName, data });
+					return;
+				}
+				reject(null);
+			});
+		});
+	});
+}
+
+function prepareSubsetSubtitle(videoName, subtitleContent) {
+	return new Promise((resolve, reject) => {
+		resolve();
+	});
+}
+
 // 生成 M3U8 播放列表
 function generatePlaylist(videoPath, videoDuration, videoHasAudio, videoTimestamps) {
 	const encodedVideoPath = encodeURIComponent(videoPath);
@@ -213,11 +258,11 @@ function generatePlaylist(videoPath, videoDuration, videoHasAudio, videoTimestam
 	let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2333\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
 	for (let i = 0; i < videoTimestamps.length; i++) {
 		if (videoTimestamps.length === (i + 1)) {
-			let segmentDuration = (videoDuration - videoTimestamps[i]).toFixed(3);
+			let segmentDuration = round(videoDuration - videoTimestamps[i]);
 			playlist += `#EXTINF:${segmentDuration},\n${baseURL}&start=${videoTimestamps[i]}&duration=${segmentDuration}\n`;
 			break;
 		}
-		let segmentDuration = (videoTimestamps[i + 1] - videoTimestamps[i]).toFixed(3);
+		let segmentDuration = round(videoTimestamps[i + 1] - videoTimestamps[i]);
 		playlist += `#EXTINF:${segmentDuration},\n${baseURL}&start=${videoTimestamps[i]}&duration=${segmentDuration}\n`;
 	}
 	playlist += "#EXT-X-ENDLIST\n";
@@ -234,18 +279,20 @@ function transcode(videoPath, startTime, durationTime, videoHasAudio) {
 		}
 		currentTranscodingTasks++;
 
-		const startTimeStr = String(roundUp(startTime));
-		const delayTimeStr = String(roundUp(startTime) / 2);
-		const durationTimeStr = String(roundDown(durationTime));
+		const startTimeStr = String(round(startTime));
+		const delayTimeStr = String(round(startTime / 2));
+		const durationTimeStr = String(round(durationTime));
+		console.log(startTime);
 		console.log(startTimeStr);
+		console.log(startTime/2);
 		console.log(delayTimeStr);
+		console.log(durationTime);
 		console.log(durationTimeStr);
 		let args = [
 			'-ss', startTimeStr,
+			'-t', durationTimeStr,
 			'-accurate_seek',
 			'-i', videoPath,
-			'-ss', '0',
-			'-t', durationTimeStr,
 			'-map', '0:v:0',
 			'-c:v', encoder,
 			'-b:v', String(bitrate),
@@ -322,6 +369,10 @@ app.get('/video/rttPlaylist', async (req, res) => {
 
 		const { duration, hasAudio, timeBase } = await getVideoInfo(absPath);
 		const timestamps = await getVideoKeyframesTimestamp(absPath, timeBase);
+		readSubtitle(videoPath).then(function ({ videoName, subtitleContent }) {
+			prepareSubsetSubtitle(videoName.toLowerCase(), subtitleContent);
+		}).catch(function () {
+		});
 		const playlist = generatePlaylist(videoPath, duration, hasAudio, timestamps);
 		res.set('Content-Type', 'application/vnd.apple.mpegurl');
 		res.send(playlist);
