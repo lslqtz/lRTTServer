@@ -2,16 +2,16 @@ const express = require('express');
 const { execSync, exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const retrieve = require("retrieve-keyframes").get
 const { URL } = require('url');
 
 const app = express();
 const port = 8082;
 
+let bitrate = '4567k';
 let decoder = '';
 let encoder = 'h264';
 let runtimeDir = process.cwd();
-let videoSegmentDuration = 10;
-let videoSegmentDurationStr = String(videoSegmentDuration);
 
 // 最大同时转码任务数
 const maxTranscodingTasks = 10;
@@ -39,22 +39,6 @@ function init() {
 	} else {
 		runtimeDir = process.cwd();
 	}
-
-	// 解析命令行参数
-	for (let i = 0; i < args.length; i++) {
-		if (args[i] === '--st') {
-			const parsedDuration = parseInt(args[i + 1], 10);
-			if (isNaN(parsedDuration)) {
-				console.warn(`无效的分片时长参数: "${args[i + 1]}", 使用默认值 ${videoSegmentDuration}.`)
-			} else {
-				videoSegmentDuration = parsedDuration;
-			}
-			videoSegmentDurationStr = String(videoSegmentDuration);
-			i++; // Skip the next argument since it's the value of -st
-			break; // 找到 st 参数, 跳出循环
-		}
-	}
-
 
 	console.log(`当前运行目录: ${runtimeDir}`);
 	if (!runtimeDir) {
@@ -132,10 +116,18 @@ function safeFilePath(baseDir, relativePath) {
 	}
 }
 
+function roundDown(num, precision = 3) {
+	return (Math.floor(num * Math.pow(10, precision)) / Math.pow(10, precision));
+}
+
+function roundUp(num, precision = 3) {
+	return (Math.ceil(num * Math.pow(10, precision)) / Math.pow(10, precision));
+}
+
 // 获取视频文件信息
 function getVideoInfo(videoPath) {
 	return new Promise((resolve, reject) => {
-		const cmd = `ffprobe -v error -show_entries format=duration -show_entries stream=index,codec_type,duration -of json ${videoPath}`;
+		const cmd = `ffprobe -v error -show_entries format=duration -show_entries stream=index,codec_type,duration,time_base -of json ${videoPath}`;
 		exec(cmd, (err, stdout, stderr) => {
 			if (err) {
 				console.error(`无法获取视频信息: ${err.message}`);
@@ -146,19 +138,28 @@ function getVideoInfo(videoPath) {
 			try {
 				const info = JSON.parse(stdout);
 				let duration = -1;
-				let hasAudio = 0;
 				let formatDuration = -1;
+				let hasAudio = 0;
+				let timeBase = 0.001;
 
 				// 提取 format duration
 				if (info.format && info.format.duration) {
-					formatDuration = info.format.duration
+					formatDuration = info.format.duration;
 				}
 				
 				// 提取 stream 信息
 				if (info.streams) {
 					for (const stream of info.streams) {
-						if (stream.index === 0 && stream.codec_type === "video" && stream.duration) {
-							duration = stream.duration
+						if (stream.index === 0 && stream.codec_type === "video") {
+							if (stream.duration) {
+								duration = stream.duration;
+							}
+							if (stream.time_base) {
+								const [numerator, denominator] = stream.time_base.split('/').map(Number);
+								if (!isNaN(numerator) && !isNaN(denominator)) {
+									timeBase = (numerator / denominator);
+								}
+							}
 						}
 						if (stream.index === 1 && stream.codec_type === "audio") {
 							hasAudio = 1;
@@ -176,7 +177,9 @@ function getVideoInfo(videoPath) {
 					return;
 				}
 
-				resolve({ duration, hasAudio });
+				duration = roundDown(duration);
+
+				resolve({ duration, hasAudio, timeBase });
 			} catch (parseError) {
 				console.error("解析 JSON 出错:", parseError);
 				reject("解析视频信息出错, 见控制台日志.");
@@ -185,30 +188,44 @@ function getVideoInfo(videoPath) {
 		});
 	});
 }
-function roundDown(num, precision = 3) {
-	return (Math.floor(num * Math.pow(10, precision)) / Math.pow(10, precision));
+
+function getVideoKeyframesTimestamp(videoPath, timeBase) {
+	return new Promise((resolve, reject) => {
+		retrieve(videoPath, (videoPath.match(/\.mkv/) ? "mkv" : "mp4"), function (err, frames) {
+			if (err) {
+				console.error(`无法获取视频关键帧: ${err.message}`);
+				reject(`无法获取视频关键帧, 见控制台日志.`);
+				return;
+			}
+			let videoTimestamps = [];
+			frames.forEach((v) => {
+				videoTimestamps.push(roundUp(v.pts * timeBase));
+			});
+			resolve(videoTimestamps);
+		});
+	});
 }
 
 // 生成 M3U8 播放列表
-function generatePlaylist(videoPath, duration, videoHasAudio) {
+function generatePlaylist(videoPath, videoDuration, videoHasAudio, videoTimestamps) {
 	const encodedVideoPath = encodeURIComponent(videoPath);
 	const baseURL = `/video/rttSegment?path=${encodedVideoPath}&audio=${videoHasAudio}`;
-	let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${videoSegmentDurationStr}\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
-	let maxSegment = (duration / videoSegmentDuration);
-	let maxSegmentInt = Math.ceil(maxSegment);
-	let endDiffSecStr = String(roundDown((maxSegmentInt - maxSegment) * videoSegmentDuration));
-	for (let i = 0; i < maxSegmentInt; i++) {
-		if (maxSegmentInt === (i + 1)) {
-			playlist += `#EXTINF:${endDiffSecStr},\n${baseURL}&segment=${i}\n`;
+	let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2333\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
+	for (let i = 0; i < videoTimestamps.length; i++) {
+		if (videoTimestamps.length === (i + 1)) {
+			let segmentDuration = (videoDuration - videoTimestamps[i]).toFixed(3);
+			playlist += `#EXTINF:${segmentDuration},\n${baseURL}&start=${videoTimestamps[i]}&duration=${segmentDuration}\n`;
 			break;
 		}
-		playlist += `#EXTINF:${videoSegmentDurationStr}.000,\n${baseURL}&segment=${i}\n`;
+		let segmentDuration = (videoTimestamps[i + 1] - videoTimestamps[i]).toFixed(3);
+		playlist += `#EXTINF:${segmentDuration},\n${baseURL}&start=${videoTimestamps[i]}&duration=${segmentDuration}\n`;
 	}
 	playlist += "#EXT-X-ENDLIST\n";
 	return playlist;
 }
+
 // 实时转码
-function transcode(videoPath, startTime, videoHasAudio) {
+function transcode(videoPath, startTime, durationTime, videoHasAudio) {
 	return new Promise((resolve, reject) => {
 		// 检查是否达到最大转码任务数
 		if (currentTranscodingTasks >= maxTranscodingTasks) {
@@ -217,20 +234,26 @@ function transcode(videoPath, startTime, videoHasAudio) {
 		}
 		currentTranscodingTasks++;
 
-		const startTimeStr = String(startTime / 2);
+		const startTimeStr = String(roundUp(startTime));
+		const delayTimeStr = String(roundUp(startTime) / 2);
+		const durationTimeStr = String(roundDown(durationTime));
+		console.log(startTimeStr);
+		console.log(delayTimeStr);
+		console.log(durationTimeStr);
 		let args = [
 			'-ss', startTimeStr,
 			'-accurate_seek',
 			'-i', videoPath,
-			'-ss', startTimeStr,
-			'-t', videoSegmentDurationStr,
+			'-ss', '0',
+			'-t', durationTimeStr,
 			'-map', '0:v:0',
 			'-c:v', encoder,
+			'-b:v', String(bitrate),
 			'-bsf:v', 'h264_mp4toannexb',
 			'-avoid_negative_ts', 'make_zero',
 			'-start_at_zero',
-			'-muxdelay', startTimeStr,
-			'-muxpreload', startTimeStr,
+			'-muxdelay', delayTimeStr,
+			'-muxpreload', delayTimeStr,
 			'-f', 'mpegts',
 			'pipe:1'
 		];
@@ -297,8 +320,9 @@ app.get('/video/rttPlaylist', async (req, res) => {
 			return res.status(404).send("视频文件不存在.");
 		}
 
-		const { duration, hasAudio } = await getVideoInfo(absPath)
-		const playlist = generatePlaylist(videoPath, duration, hasAudio);
+		const { duration, hasAudio, timeBase } = await getVideoInfo(absPath);
+		const timestamps = await getVideoKeyframesTimestamp(absPath, timeBase);
+		const playlist = generatePlaylist(videoPath, duration, hasAudio, timestamps);
 		res.set('Content-Type', 'application/vnd.apple.mpegurl');
 		res.send(playlist);
 	} catch (err) {
@@ -309,20 +333,22 @@ app.get('/video/rttPlaylist', async (req, res) => {
 // 处理分片请求
 app.get('/video/rttSegment', async (req, res) => {
 	const videoPath = req.query.path;
-	const videoSegmentStr = req.query.segment;
+	const videoStartTimeStr = req.query.start;
+	const videoDurationTimeStr = req.query.duration;
 	const videoHasAudio = req.query.audio === '1';
 
-	if (!videoPath || !videoSegmentStr) {
+	if (!videoPath || !videoStartTimeStr || !videoDurationTimeStr) {
 		return res.status(400).send("缺少必要参数.");
 	}
-	const videoSegment = parseInt(videoSegmentStr, 10);
-	if (isNaN(videoSegment)) {
-		return res.status(400).send("无效的分片参数.");
+	videoStartTime = parseFloat(videoStartTimeStr);
+	videoDurationTime = parseFloat(videoDurationTimeStr);
+	if (isNaN(videoStartTime) || isNaN(videoDurationTime)) {
+		return res.status(400).send("无效的时间参数.");
 	}
 
 	try {
 		const absPath = await safeFilePath(runtimeDir, videoPath);
-		const buffer = await transcode(absPath, videoSegment * videoSegmentDuration, videoHasAudio);
+		const buffer = await transcode(absPath, videoStartTime, videoDurationTime, videoHasAudio);
 		res.set('Content-Type', 'video/MP2T');
 		res.set('Content-Length', String(buffer.length));
 		res.send(buffer);
