@@ -17,5 +17,8 @@
   "disable_scene_cut": true,
   "log_ffmpeg_error": true,
   "log_simple": true,
-  "log_detail": true
+  "log_detail": true,
+  "basic_auth_enabled": false,
+  "basic_auth_user": "",
+  "basic_auth_pass": ""
 }

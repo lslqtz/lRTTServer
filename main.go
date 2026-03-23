@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,9 @@ type Config struct {
 	LogFFmpegError  bool
 	LogSimple       bool
 	LogDetail       bool
+	BasicAuthUser   string
+	BasicAuthPass   string
+	BasicAuthOn     bool
 }
 
 type ConfigFile struct {
@@ -70,6 +74,9 @@ type ConfigFile struct {
 	LogFFmpegError  *bool   `json:"log_ffmpeg_error"`
 	LogSimple       *bool   `json:"log_simple"`
 	LogDetail       *bool   `json:"log_detail"`
+	BasicAuthUser   *string `json:"basic_auth_user"`
+	BasicAuthPass   *string `json:"basic_auth_pass"`
+	BasicAuthOn     *bool   `json:"basic_auth_enabled"`
 }
 
 type VideoInfo struct {
@@ -118,6 +125,9 @@ func main() {
 	}
 	cfg.Encoder = pickEncoder(cfg.Encoder, cfg.FFmpegPath)
 	logSimple(cfg, "MAIN", "encoder: %s decoder: %s", cfg.Encoder, cfg.Decoder)
+	if cfg.BasicAuthOn {
+		logSimple(cfg, "MAIN", "basic auth: enabled user=%s", cfg.BasicAuthUser)
+	}
 
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		fatalf("MAIN", "failed to create cache dir: %v", err)
@@ -125,19 +135,22 @@ func main() {
 
 	jobSem = make(chan struct{}, cfg.MaxJobs)
 
-	http.HandleFunc("/video/rttPlaylist", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/video/rttPlaylist", withAuth(cfg, func(w http.ResponseWriter, r *http.Request) {
 		handlePlaylist(w, r, cfg)
-	})
-	http.HandleFunc("/video/rttSegment", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/video/rttSegment", withAuth(cfg, func(w http.ResponseWriter, r *http.Request) {
 		handleSegment(w, r, cfg)
-	})
-	http.HandleFunc("/video/rttSegment.ts", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/video/rttSegment.ts", withAuth(cfg, func(w http.ResponseWriter, r *http.Request) {
 		handleSegment(w, r, cfg)
-	})
-	http.HandleFunc("/browse", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/browse", withAuth(cfg, func(w http.ResponseWriter, r *http.Request) {
 		handleBrowse(w, r, cfg)
-	})
+	}))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(cfg, w, r) {
+			return
+		}
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/browse", http.StatusFound)
 			return
@@ -205,6 +218,9 @@ func loadConfig() Config {
 		LogFFmpegError:  true,
 		LogSimple:       true,
 		LogDetail:       true,
+		BasicAuthUser:   "",
+		BasicAuthPass:   "",
+		BasicAuthOn:     false,
 	}
 	if found {
 		applyConfigFile(&cfg, fileCfg)
@@ -240,6 +256,20 @@ func loadConfig() Config {
 	}
 	cfg.LogSimple = envBool01("RTT_LOG_SIMPLE", cfg.LogSimple)
 	cfg.LogDetail = envBool01("RTT_LOG_DETAIL", cfg.LogDetail)
+	if v := envString("RTT_BASIC_AUTH_USER", ""); v != "" {
+		cfg.BasicAuthUser = v
+	}
+	if v := envString("RTT_BASIC_AUTH_PASS", ""); v != "" {
+		cfg.BasicAuthPass = v
+	}
+	if v := os.Getenv("RTT_BASIC_AUTH_ENABLED"); v != "" {
+		cfg.BasicAuthOn = envBool01("RTT_BASIC_AUTH_ENABLED", cfg.BasicAuthOn)
+	}
+	if cfg.BasicAuthOn {
+		if cfg.BasicAuthUser == "" || cfg.BasicAuthPass == "" {
+			fatalf("CONFIG", "basic auth enabled but user/pass missing")
+		}
+	}
 
 	cfg.VideoDirs = normalizeVideoDirs(cfg.RuntimeDir, cfg.VideoDirs)
 
@@ -395,6 +425,15 @@ func applyConfigFile(cfg *Config, fileCfg ConfigFile) {
 	}
 	if fileCfg.LogDetail != nil {
 		cfg.LogDetail = *fileCfg.LogDetail
+	}
+	if fileCfg.BasicAuthUser != nil {
+		cfg.BasicAuthUser = *fileCfg.BasicAuthUser
+	}
+	if fileCfg.BasicAuthPass != nil {
+		cfg.BasicAuthPass = *fileCfg.BasicAuthPass
+	}
+	if fileCfg.BasicAuthOn != nil {
+		cfg.BasicAuthOn = *fileCfg.BasicAuthOn
 	}
 }
 
@@ -1106,6 +1145,30 @@ func logDetail(cfg Config, module, format string, args ...interface{}) {
 func fatalf(module, format string, args ...interface{}) {
 	logLine(module, fmt.Sprintf(format, args...))
 	os.Exit(1)
+}
+
+func withAuth(cfg Config, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(cfg, w, r) {
+			return
+		}
+		h(w, r)
+	}
+}
+
+func checkAuth(cfg Config, w http.ResponseWriter, r *http.Request) bool {
+	if !cfg.BasicAuthOn {
+		return true
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok ||
+		subtle.ConstantTimeCompare([]byte(user), []byte(cfg.BasicAuthUser)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.BasicAuthPass)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Basic realm="RTT"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func playlistMetaPath(cacheDir string) string {
