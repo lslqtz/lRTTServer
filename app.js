@@ -7,7 +7,7 @@ const { URL } = require('url');
 const app = express();
 const port = 8082;
 
-let bitrate = '4567k';
+let bitrate = '2500k';
 let decoder = '';
 let encoder = 'h264';
 let runtimeDir = process.cwd();
@@ -154,7 +154,7 @@ function getVideoInfo(videoPath) {
 				if (info.format && info.format.duration) {
 					formatDuration = info.format.duration
 				}
-				
+
 				// 提取 stream 信息
 				if (info.streams) {
 					for (const stream of info.streams) {
@@ -187,14 +187,14 @@ function getVideoInfo(videoPath) {
 	});
 }
 function roundDown(num, precision = 4) {
-	return (Math.floor(num * Math.pow(10, precision)) / Math.pow(10, precision));
+	return Number(num.toFixed(precision));
 }
 
 // 生成 M3U8 播放列表
 function generatePlaylist(videoPath, duration, videoHasAudio) {
 	const encodedVideoPath = encodeURIComponent(videoPath);
 	const baseURL = `/video/rttSegment?path=${encodedVideoPath}&audio=${videoHasAudio}`;
-	let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${videoSegmentDurationStr}\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
+	let playlist = `#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:${videoSegmentDurationStr}\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
 	let maxSegment = (duration / videoSegmentDuration);
 	let maxSegmentInt = Math.ceil(maxSegment);
 	let endDiffSecStr = String(roundDown((maxSegmentInt - maxSegment) * videoSegmentDuration));
@@ -209,71 +209,90 @@ function generatePlaylist(videoPath, duration, videoHasAudio) {
 	return playlist;
 }
 // 实时转码
-function transcode(videoPath, startTime, videoHasAudio) {
-	return new Promise((resolve, reject) => {
-		// 检查是否达到最大转码任务数
-		if (currentTranscodingTasks >= maxTranscodingTasks) {
-			reject("转码任务已满, 请稍后重试.");
-			return;
-		}
-		currentTranscodingTasks++;
+function transcode(videoPath, startTime, videoHasAudio, res) {
+	// 检查是否达到最大转码任务数
+	if (currentTranscodingTasks >= maxTranscodingTasks) {
+		res.status(503).send("转码任务已满, 请稍后重试.");
+		return;
+	}
+	currentTranscodingTasks++;
 
-		const delayTimeStr = String(roundDown(startTime / 2));
-		let args = [
-			'-ss', startTime,
-			'-t', videoSegmentDurationStr,
-			'-accurate_seek',
-			'-i', videoPath,
-			'-map', '0:v:0',
-			'-c:v', encoder,
-			'-b:v', String(bitrate),
-			'-bsf:v', 'h264_mp4toannexb',
-			'-muxdelay', delayTimeStr,
-			'-muxpreload', delayTimeStr,
-			'-f', 'mpegts',
-			'pipe:1'
-		];
+	let args = [
+		'-ss', startTime,
+		'-t', videoSegmentDurationStr,
+		'-copyts',
+		'-accurate_seek',
+		'-i', videoPath,
+		'-map', '0:v:0',
+		'-c:v', encoder,
+		'-b:v', String(bitrate),
+		'-maxrate', String(bitrate),
+		'-bufsize', '1000k',
+		'-bf', '0',
+		'-realtime', '1',
+		'-threads', '0',
+		'-r', '60',
+		'-g', '60',
+		'-keyint_min', '60',
+		'-sc_threshold', '0',
+		'-bsf:v', 'h264_mp4toannexb',
+		'-mpegts_flags', 'resend_headers',
+		'-muxdelay', '0',
+		'-pcr_period', '20',
+		'-flush_packets', '1',
+		'-f', 'mpegts',
+		'pipe:1'
+	];
 
-		if (decoder !== '') {
-			args.unshift('-hwaccel', decoder);
-		}
+	if (decoder !== '') {
+		args.unshift('-hwaccel', decoder);
+	}
 
-		if (videoHasAudio) {
-			args.splice(args.indexOf('-bsf:v') + 2, 0,
-				'-map', '0:a:0',
-				'-c:a', 'aac',
-				'-b:a', '256k'
-			);
-		}
+	if (videoHasAudio) {
+		args.splice(args.indexOf('-bsf:v') + 2, 0,
+			'-map', '0:a:0',
+			'-c:a', 'aac',
+			'-b:a', '128k',
+			'-ar', '48000'
+		);
+	}
 
-		const ffmpegProcess = spawn('ffmpeg', args, { encoding: 'buffer' });
+	const ffmpegProcess = spawn('ffmpeg', args);
 
-		const outputBuffer = [];
-		const errorBuffer = [];
+	res.set('Content-Type', 'video/MP2T');
 
-		ffmpegProcess.stdout.on('data', (data) => {
-			outputBuffer.push(data);
-		});
+	ffmpegProcess.stdout.pipe(res);
 
-		ffmpegProcess.stderr.on('data', (data) => {
-			errorBuffer.push(data);
-		});
+	ffmpegProcess.stderr.on('data', (data) => {
+		// 仅在控制台显示错误信息
+		// console.error(`FFmpeg STDERR: ${data}`);
+	});
 
-		ffmpegProcess.on('close', (code) => {
-			currentTranscodingTasks--;
-			const err = Buffer.concat(errorBuffer).toString();
-			if (code !== 0) {
-				console.error(`转码失败 (Code: ${code}): ${err || 'FFmpeg 执行失败'}`);
-				return reject(`转码失败, 见控制台日志.`);
+	ffmpegProcess.on('close', (code) => {
+		currentTranscodingTasks--;
+		if (code !== 0 && code !== null) {
+			console.error(`转码进程意外退出 (Code: ${code})`);
+			if (!res.writableEnded) {
+				res.status(500).end();
 			}
-			resolve(Buffer.concat(outputBuffer));
-		});
+		} else {
+			res.end();
+		}
+	});
 
-		ffmpegProcess.on('error', (err) => {
-			currentTranscodingTasks--;
-			console.error(`转码过程发生错误: ${err}`);
-			return reject(`转码失败, 见控制台日志.`);
-		});
+	ffmpegProcess.on('error', (err) => {
+		currentTranscodingTasks--;
+		console.error(`启动转码过程发生错误: ${err}`);
+		if (!res.writableEnded) {
+			res.status(500).end();
+		}
+	});
+
+	// 客户端断开连接时中止转码
+	res.on('close', () => {
+		if (ffmpegProcess.exitCode === null) {
+			ffmpegProcess.kill('SIGKILL');
+		}
 	});
 }
 
@@ -321,10 +340,7 @@ app.get('/video/rttSegment', async (req, res) => {
 
 	try {
 		const absPath = await safeFilePath(runtimeDir, videoPath);
-		const buffer = await transcode(absPath, videoSegment * videoSegmentDuration, videoHasAudio);
-		res.set('Content-Type', 'video/MP2T');
-		res.set('Content-Length', String(buffer.length));
-		res.send(buffer);
+		transcode(absPath, videoSegment * videoSegmentDuration, videoHasAudio, res);
 	} catch (err) {
 		res.status(500).send(err);
 	}
