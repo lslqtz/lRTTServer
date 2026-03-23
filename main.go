@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math"
@@ -15,7 +16,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +29,7 @@ import (
 type Config struct {
 	Port            int
 	RuntimeDir      string
+	VideoDir        string
 	SegmentDuration int
 	Bitrate         string
 	AudioBitrate    string
@@ -40,13 +45,40 @@ type Config struct {
 	ForceKeyFrames  bool
 	DisableSceneCut bool
 	LogFFmpegError  bool
+	LogSimple       bool
+	LogDetail       bool
+}
+
+type ConfigFile struct {
+	Port            *int    `json:"port"`
+	RuntimeDir      *string `json:"runtime_dir"`
+	VideoDirPath    *string `json:"videoDirPath"`
+	SegmentDuration *int    `json:"segment"`
+	Bitrate         *string `json:"bitrate"`
+	AudioBitrate    *string `json:"audio_bitrate"`
+	Encoder         *string `json:"encoder"`
+	Decoder         *string `json:"decoder"`
+	FFmpegPath      *string `json:"ffmpeg"`
+	FFprobePath     *string `json:"ffprobe"`
+	CacheDir        *string `json:"cache_dir"`
+	MaxJobs         *int    `json:"max_jobs"`
+	PlaylistWait    *int    `json:"playlist_wait"`
+	SegmentWait     *int    `json:"segment_wait"`
+	PreferAudioCopy *bool   `json:"audio_copy"`
+	ForceKeyFrames  *bool   `json:"force_keyframe"`
+	DisableSceneCut *bool   `json:"disable_scene_cut"`
+	LogFFmpegError  *bool   `json:"log_ffmpeg_error"`
+	LogSimple       *bool   `json:"log_simple"`
+	LogDetail       *bool   `json:"log_detail"`
 }
 
 type VideoInfo struct {
-	Duration   float64
-	HasAudio   bool
-	AudioCodec string
-	FPS        float64
+	Duration    float64
+	HasAudio    bool
+	AudioCodec  string
+	AudioCh     int
+	AudioLayout string
+	FPS         float64
 }
 
 type job struct {
@@ -75,8 +107,9 @@ type cachedInfo struct {
 
 func main() {
 	cfg := loadConfig()
-	log.Printf("runtime dir: %s", cfg.RuntimeDir)
-	log.Printf("segment duration: %ds", cfg.SegmentDuration)
+	logSimple(cfg, "MAIN", "runtime dir: %s", cfg.RuntimeDir)
+	logSimple(cfg, "MAIN", "video dir: %s", cfg.VideoDir)
+	logSimple(cfg, "MAIN", "segment duration: %ds", cfg.SegmentDuration)
 
 	if cfg.Encoder == "" || cfg.Encoder == "auto" {
 		enc, dec := detectHardware(cfg.FFmpegPath)
@@ -90,9 +123,10 @@ func main() {
 	if cfg.Encoder == "" {
 		cfg.Encoder = "libx264"
 	}
+	logSimple(cfg, "MAIN", "encoder: %s decoder: %s", cfg.Encoder, cfg.Decoder)
 
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
-		log.Fatalf("failed to create cache dir: %v", err)
+		fatalf("MAIN", "failed to create cache dir: %v", err)
 	}
 
 	jobSem = make(chan struct{}, cfg.MaxJobs)
@@ -109,15 +143,22 @@ func main() {
 	http.HandleFunc("/video/hls/", func(w http.ResponseWriter, r *http.Request) {
 		handleHLSFile(w, r, cfg)
 	})
+	http.HandleFunc("/browse", func(w http.ResponseWriter, r *http.Request) {
+		handleBrowse(w, r, cfg)
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/browse", http.StatusFound)
+			return
+		}
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("404 Not Found."))
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	log.Printf("listening on %s", addr)
+	logSimple(cfg, "MAIN", "listening on %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("server error: %v", err)
+		fatalf("MAIN", "server error: %v", err)
 	}
 }
 
@@ -142,28 +183,82 @@ func loadConfig() Config {
 		}
 	}
 
-	cfg := Config{
-		Port:            envInt("RTT_PORT", 8082),
-		RuntimeDir:      envString("RTT_RUNTIME", runtimeDir),
-		SegmentDuration: envInt("RTT_SEGMENT", 5),
-		Bitrate:         envString("RTT_BITRATE", "4567k"),
-		AudioBitrate:    envString("RTT_AUDIO_BITRATE", "256k"),
-		Encoder:         envString("RTT_ENCODER", "auto"),
-		Decoder:         envString("RTT_DECODER", ""),
-		FFmpegPath:      envString("RTT_FFMPEG", "ffmpeg"),
-		FFprobePath:     envString("RTT_FFPROBE", "ffprobe"),
-		MaxJobs:         envInt("RTT_MAX_JOBS", 2),
-		PlaylistWait:    time.Duration(envInt("RTT_PLAYLIST_WAIT", 8)) * time.Second,
-		SegmentWait:     time.Duration(envInt("RTT_SEGMENT_WAIT", 30)) * time.Second,
-		PreferAudioCopy: envString("RTT_AUDIO_COPY", "0") != "0",
-		ForceKeyFrames:  envString("RTT_FORCE_KEYFRAME", "1") != "0",
-		DisableSceneCut: envString("RTT_SC_THRESHOLD", "0") == "0",
-		LogFFmpegError:  true,
+	configPath := envString("RTT_CONFIG", "")
+	if configPath == "" {
+		configPath = filepath.Join(runtimeDir, "config.json")
+	} else if !filepath.IsAbs(configPath) {
+		configPath = filepath.Join(runtimeDir, configPath)
+	}
+	fileCfg, found, err := readConfigFile(configPath)
+	if err != nil {
+		fatalf("CONFIG", "invalid config %s: %v", configPath, err)
 	}
 
-	cacheDir := envString("RTT_CACHE_DIR", "")
+	cfg := Config{
+		Port:            8082,
+		RuntimeDir:      runtimeDir,
+		VideoDir:        runtimeDir,
+		SegmentDuration: 5,
+		Bitrate:         "4567k",
+		AudioBitrate:    "256k",
+		Encoder:         "auto",
+		Decoder:         "",
+		FFmpegPath:      "ffmpeg",
+		FFprobePath:     "ffprobe",
+		MaxJobs:         2,
+		PlaylistWait:    8 * time.Second,
+		SegmentWait:     30 * time.Second,
+		PreferAudioCopy: false,
+		ForceKeyFrames:  true,
+		DisableSceneCut: true,
+		LogFFmpegError:  true,
+		LogSimple:       true,
+		LogDetail:       true,
+	}
+	if found {
+		applyConfigFile(&cfg, fileCfg)
+	}
+
+	cfg.Port = envInt("RTT_PORT", cfg.Port)
+	cfg.RuntimeDir = envString("RTT_RUNTIME", cfg.RuntimeDir)
+	cfg.VideoDir = envString("RTT_VIDEO_DIR", cfg.VideoDir)
+	cfg.SegmentDuration = envInt("RTT_SEGMENT", cfg.SegmentDuration)
+	cfg.Bitrate = envString("RTT_BITRATE", cfg.Bitrate)
+	cfg.AudioBitrate = envString("RTT_AUDIO_BITRATE", cfg.AudioBitrate)
+	cfg.Encoder = envString("RTT_ENCODER", cfg.Encoder)
+	cfg.Decoder = envString("RTT_DECODER", cfg.Decoder)
+	cfg.FFmpegPath = envString("RTT_FFMPEG", cfg.FFmpegPath)
+	cfg.FFprobePath = envString("RTT_FFPROBE", cfg.FFprobePath)
+	cfg.MaxJobs = envInt("RTT_MAX_JOBS", cfg.MaxJobs)
+	if v := os.Getenv("RTT_PLAYLIST_WAIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.PlaylistWait = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("RTT_SEGMENT_WAIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.SegmentWait = time.Duration(n) * time.Second
+		}
+	}
+	cfg.PreferAudioCopy = envBool01("RTT_AUDIO_COPY", cfg.PreferAudioCopy)
+	cfg.ForceKeyFrames = envBool01("RTT_FORCE_KEYFRAME", cfg.ForceKeyFrames)
+	if v := os.Getenv("RTT_SC_THRESHOLD"); v != "" {
+		cfg.DisableSceneCut = v == "0"
+	}
+	cfg.LogSimple = envBool01("RTT_LOG_SIMPLE", cfg.LogSimple)
+	cfg.LogDetail = envBool01("RTT_LOG_DETAIL", cfg.LogDetail)
+
+	if cfg.VideoDir == "" {
+		cfg.VideoDir = cfg.RuntimeDir
+	} else if !filepath.IsAbs(cfg.VideoDir) {
+		cfg.VideoDir = filepath.Join(cfg.RuntimeDir, cfg.VideoDir)
+	}
+
+	cacheDir := envString("RTT_CACHE_DIR", cfg.CacheDir)
 	if cacheDir == "" {
 		cacheDir = filepath.Join(cfg.RuntimeDir, "tmp", "hls")
+	} else if !filepath.IsAbs(cacheDir) {
+		cacheDir = filepath.Join(cfg.RuntimeDir, cacheDir)
 	}
 	cfg.CacheDir = cacheDir
 	return cfg
@@ -185,6 +280,98 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envBool01(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		return v != "0"
+	}
+	return def
+}
+
+func readConfigFile(path string) (ConfigFile, bool, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ConfigFile{}, false, nil
+		}
+		return ConfigFile{}, false, err
+	}
+	if st.IsDir() {
+		return ConfigFile{}, false, fmt.Errorf("config path is a directory")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ConfigFile{}, false, err
+	}
+	var fileCfg ConfigFile
+	if err := json.Unmarshal(data, &fileCfg); err != nil {
+		return ConfigFile{}, true, err
+	}
+	return fileCfg, true, nil
+}
+
+func applyConfigFile(cfg *Config, fileCfg ConfigFile) {
+	if fileCfg.Port != nil {
+		cfg.Port = *fileCfg.Port
+	}
+	if fileCfg.RuntimeDir != nil {
+		cfg.RuntimeDir = *fileCfg.RuntimeDir
+	}
+	if fileCfg.VideoDirPath != nil {
+		cfg.VideoDir = *fileCfg.VideoDirPath
+	}
+	if fileCfg.SegmentDuration != nil {
+		cfg.SegmentDuration = *fileCfg.SegmentDuration
+	}
+	if fileCfg.Bitrate != nil {
+		cfg.Bitrate = *fileCfg.Bitrate
+	}
+	if fileCfg.AudioBitrate != nil {
+		cfg.AudioBitrate = *fileCfg.AudioBitrate
+	}
+	if fileCfg.Encoder != nil {
+		cfg.Encoder = *fileCfg.Encoder
+	}
+	if fileCfg.Decoder != nil {
+		cfg.Decoder = *fileCfg.Decoder
+	}
+	if fileCfg.FFmpegPath != nil {
+		cfg.FFmpegPath = *fileCfg.FFmpegPath
+	}
+	if fileCfg.FFprobePath != nil {
+		cfg.FFprobePath = *fileCfg.FFprobePath
+	}
+	if fileCfg.CacheDir != nil {
+		cfg.CacheDir = *fileCfg.CacheDir
+	}
+	if fileCfg.MaxJobs != nil {
+		cfg.MaxJobs = *fileCfg.MaxJobs
+	}
+	if fileCfg.PlaylistWait != nil {
+		cfg.PlaylistWait = time.Duration(*fileCfg.PlaylistWait) * time.Second
+	}
+	if fileCfg.SegmentWait != nil {
+		cfg.SegmentWait = time.Duration(*fileCfg.SegmentWait) * time.Second
+	}
+	if fileCfg.PreferAudioCopy != nil {
+		cfg.PreferAudioCopy = *fileCfg.PreferAudioCopy
+	}
+	if fileCfg.ForceKeyFrames != nil {
+		cfg.ForceKeyFrames = *fileCfg.ForceKeyFrames
+	}
+	if fileCfg.DisableSceneCut != nil {
+		cfg.DisableSceneCut = *fileCfg.DisableSceneCut
+	}
+	if fileCfg.LogFFmpegError != nil {
+		cfg.LogFFmpegError = *fileCfg.LogFFmpegError
+	}
+	if fileCfg.LogSimple != nil {
+		cfg.LogSimple = *fileCfg.LogSimple
+	}
+	if fileCfg.LogDetail != nil {
+		cfg.LogDetail = *fileCfg.LogDetail
+	}
+}
+
 func safeFilePath(baseDir, rel string) (string, error) {
 	clean := filepath.Clean(rel)
 	abs := filepath.Join(baseDir, clean)
@@ -202,13 +389,89 @@ func safeFilePath(baseDir, rel string) (string, error) {
 	return abs, nil
 }
 
+func safeDirPath(baseDir, rel string) (string, string, error) {
+	clean := filepath.Clean(rel)
+	if clean == "." || clean == string(os.PathSeparator) {
+		clean = ""
+	}
+	abs := baseDir
+	if clean != "" {
+		abs = filepath.Join(baseDir, clean)
+	}
+	abs, err := filepath.Abs(abs)
+	if err != nil {
+		return "", "", err
+	}
+	baseAbs, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", "", err
+	}
+	if !strings.HasPrefix(abs, baseAbs+string(os.PathSeparator)) && abs != baseAbs {
+		return "", "", errors.New("illegal path")
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", "", err
+	}
+	if !st.IsDir() {
+		return "", "", errors.New("not a directory")
+	}
+	relPath, err := filepath.Rel(baseAbs, abs)
+	if err != nil {
+		return "", "", err
+	}
+	if relPath == "." {
+		relPath = ""
+	}
+	return abs, filepath.ToSlash(relPath), nil
+}
+
+func joinRel(relDir, name string) string {
+	if relDir == "" {
+		return name
+	}
+	return relDir + "/" + name
+}
+
+func parentRel(relDir string) string {
+	if relDir == "" {
+		return ""
+	}
+	p := path.Dir(relDir)
+	if p == "." || p == "/" {
+		return ""
+	}
+	return p
+}
+
+func htmlEscape(s string) string {
+	return html.EscapeString(s)
+}
+
+func isVideoFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".mp4", ".mkv", ".mov", ".webm", ".m4v", ".ts", ".avi", ".mpg", ".mpeg":
+		return true
+	default:
+		return false
+	}
+}
+
 func handlePlaylist(w http.ResponseWriter, r *http.Request, cfg Config) {
 	videoPath := r.URL.Query().Get("path")
 	if videoPath == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
 	}
-	absPath, err := safeFilePath(cfg.RuntimeDir, videoPath)
+	bitrate, err := parseBitrateParam(r, cfg.Bitrate)
+	if err != nil {
+		http.Error(w, "invalid bitrate", http.StatusBadRequest)
+		return
+	}
+	reqCfg := cfg
+	reqCfg.Bitrate = bitrate
+	absPath, err := safeFilePath(cfg.VideoDir, videoPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusForbidden)
 		return
@@ -217,16 +480,18 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	info, err := getVideoInfo(cfg, absPath)
+	info, err := getVideoInfo(reqCfg, absPath)
 	if err != nil {
 		http.Error(w, "probe failed", http.StatusInternalServerError)
 		return
 	}
-	cacheDir := buildCacheDir(cfg, absPath, info)
+	logSimple(reqCfg, "PLAY", "playlist path=%s encoder=%s bitrate=%s", absPath, reqCfg.Encoder, reqCfg.Bitrate)
+	logDetail(reqCfg, "PLAY", "audio=%t codec=%s ch=%d layout=%s duration=%.3fs", info.HasAudio, info.AudioCodec, info.AudioCh, info.AudioLayout, info.Duration)
+	cacheDir := buildCacheDir(reqCfg, absPath, info)
 	playlistPath := filepath.Join(cacheDir, "index.m3u8")
-	ensureHLSStarted(cfg, absPath, cacheDir, playlistPath, info)
+	ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
 	cacheID := filepath.Base(cacheDir)
-	playlist := buildVODPlaylist(cacheID, info.Duration, cfg.SegmentDuration)
+	playlist := buildVODPlaylist(cacheID, info.Duration, reqCfg.SegmentDuration)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	_, _ = w.Write([]byte(playlist))
 }
@@ -243,7 +508,14 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "invalid segment", http.StatusBadRequest)
 		return
 	}
-	absPath, err := safeFilePath(cfg.RuntimeDir, videoPath)
+	bitrate, err := parseBitrateParam(r, cfg.Bitrate)
+	if err != nil {
+		http.Error(w, "invalid bitrate", http.StatusBadRequest)
+		return
+	}
+	reqCfg := cfg
+	reqCfg.Bitrate = bitrate
+	absPath, err := safeFilePath(cfg.VideoDir, videoPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusForbidden)
 		return
@@ -252,14 +524,14 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	info, err := getVideoInfo(cfg, absPath)
+	info, err := getVideoInfo(reqCfg, absPath)
 	if err != nil {
 		http.Error(w, "probe failed", http.StatusInternalServerError)
 		return
 	}
-	cacheDir := buildCacheDir(cfg, absPath, info)
+	cacheDir := buildCacheDir(reqCfg, absPath, info)
 	playlistPath := filepath.Join(cacheDir, "index.m3u8")
-	ensureHLSStarted(cfg, absPath, cacheDir, playlistPath, info)
+	ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
 	segmentPath := filepath.Join(cacheDir, fmt.Sprintf("seg_%05d.ts", seg))
 	if err := waitForFile(segmentPath, cfg.SegmentWait); err != nil {
 		http.Error(w, "segment not ready", http.StatusServiceUnavailable)
@@ -267,6 +539,99 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	w.Header().Set("Content-Type", "video/MP2T")
 	serveFile(w, r, segmentPath)
+}
+
+func handleBrowse(w http.ResponseWriter, r *http.Request, cfg Config) {
+	dirParam := strings.TrimSpace(r.URL.Query().Get("dir"))
+	absDir, relDir, err := safeDirPath(cfg.VideoDir, dirParam)
+	if err != nil {
+		http.Error(w, "invalid dir", http.StatusForbidden)
+		return
+	}
+	entries, err := os.ReadDir(absDir)
+	if err != nil {
+		http.Error(w, "read dir failed", http.StatusInternalServerError)
+		return
+	}
+	type item struct {
+		Name string
+		Path string
+		Dir  bool
+	}
+	var dirs []item
+	var videos []item
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if e.IsDir() {
+			relPath := joinRel(relDir, name)
+			dirs = append(dirs, item{Name: name, Path: relPath, Dir: true})
+			continue
+		}
+		if isVideoFile(name) {
+			relPath := joinRel(relDir, name)
+			videos = append(videos, item{Name: name, Path: relPath})
+		}
+	}
+	sortItems := func(items []item) {
+		sort.Slice(items, func(i, j int) bool {
+			return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+		})
+	}
+	sortItems(dirs)
+	sortItems(videos)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	var b strings.Builder
+	b.WriteString("<!doctype html><html><head><meta charset=\"utf-8\">")
+	b.WriteString("<title>Browse</title>")
+	b.WriteString("<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;margin:20px} ")
+	b.WriteString("a{text-decoration:none} .path{color:#666;margin-bottom:12px} ")
+	b.WriteString("ul{list-style:none;padding-left:0} li{margin:6px 0}</style>")
+	b.WriteString("</head><body>")
+	b.WriteString("<h2>Browse</h2>")
+	b.WriteString("<div class=\"path\">当前目录: ")
+	if relDir == "" {
+		b.WriteString("/")
+	} else {
+		b.WriteString(htmlEscape(relDir))
+	}
+	b.WriteString("</div>")
+	if relDir != "" {
+		parent := parentRel(relDir)
+		b.WriteString("<div><a href=\"/browse?dir=")
+		b.WriteString(url.QueryEscape(parent))
+		b.WriteString("\">.. 上级目录</a></div>")
+	}
+	if len(dirs) > 0 {
+		b.WriteString("<h3>文件夹</h3><ul>")
+		for _, d := range dirs {
+			b.WriteString("<li>📁 <a href=\"/browse?dir=")
+			b.WriteString(url.QueryEscape(d.Path))
+			b.WriteString("\">")
+			b.WriteString(htmlEscape(d.Name))
+			b.WriteString("</a></li>")
+		}
+		b.WriteString("</ul>")
+	}
+	if len(videos) > 0 {
+		b.WriteString("<h3>视频</h3><ul>")
+		for _, v := range videos {
+			b.WriteString("<li>🎬 <a href=\"/video/rttPlaylist?path=")
+			b.WriteString(url.QueryEscape(v.Path))
+			b.WriteString("\">")
+			b.WriteString(htmlEscape(v.Name))
+			b.WriteString("</a></li>")
+		}
+		b.WriteString("</ul>")
+	}
+	if len(dirs) == 0 && len(videos) == 0 {
+		b.WriteString("<div>没有找到文件夹或视频文件</div>")
+	}
+	b.WriteString("</body></html>")
+	_, _ = w.Write([]byte(b.String()))
 }
 
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
@@ -388,13 +753,13 @@ func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info V
 		jobSem <- struct{}{}
 		defer func() { <-jobSem }()
 
-		log.Printf("ffmpeg start: %s", absPath)
+		logSimple(cfg, "FFMPEG", "start path=%s encoder=%s bitrate=%s", absPath, cfg.Encoder, cfg.Bitrate)
 		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 			j.err = err
 			jobsMu.Lock()
 			delete(jobs, cacheDir)
 			jobsMu.Unlock()
-			log.Printf("ffmpeg start failed: %v", err)
+			logSimple(cfg, "FFMPEG", "start failed: %v", err)
 			return
 		}
 		_ = writePlaylistMeta(cacheDir, playlistMeta{
@@ -402,14 +767,16 @@ func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info V
 			Segment:  cfg.SegmentDuration,
 		})
 		cmd := buildFFmpegCommand(cfg, absPath, cacheDir, playlistPath, info)
+		logDetail(cfg, "FFMPEG", "cmd: %s %s", cfg.FFmpegPath, strings.Join(cmd, " "))
 		if err := runFFmpeg(cfg, cmd); err != nil {
 			if isHardwareEncoder(cfg.Encoder) {
-				log.Printf("ffmpeg failed with hardware encoder, retrying with libx264: %v", err)
+				logSimple(cfg, "FFMPEG", "hardware failed, retrying with libx264: %v", err)
 				fallback := cfg
 				fallback.Encoder = "libx264"
 				cmd = buildFFmpegCommand(fallback, absPath, cacheDir, playlistPath, info)
+				logDetail(fallback, "FFMPEG", "cmd: %s %s", fallback.FFmpegPath, strings.Join(cmd, " "))
 				if err2 := runFFmpeg(fallback, cmd); err2 == nil {
-					log.Printf("ffmpeg done (fallback): %s", absPath)
+					logSimple(fallback, "FFMPEG", "done (fallback): %s", absPath)
 					return
 				} else {
 					err = err2
@@ -419,11 +786,11 @@ func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info V
 			jobsMu.Lock()
 			delete(jobs, cacheDir)
 			jobsMu.Unlock()
-			log.Printf("ffmpeg failed: %v", err)
+			logSimple(cfg, "FFMPEG", "failed: %v", err)
 			return
 		}
 		_ = markPlaylistDone(cacheDir)
-		log.Printf("ffmpeg done: %s", absPath)
+		logSimple(cfg, "FFMPEG", "done: %s", absPath)
 	}()
 }
 
@@ -473,6 +840,12 @@ func buildFFmpegCommand(cfg Config, inputPath, cacheDir, playlistPath string, in
 			args = append(args, "-c:a", "copy")
 		} else {
 			args = append(args, "-c:a", "aac", "-b:a", cfg.AudioBitrate, "-af", "aresample=async=1:min_hard_comp=0.1:first_pts=0")
+			if info.AudioCh > 0 {
+				args = append(args, "-ac", strconv.Itoa(info.AudioCh))
+			}
+			if info.AudioLayout != "" {
+				args = append(args, "-channel_layout", info.AudioLayout)
+			}
 		}
 	} else {
 		args = append(args, "-an")
@@ -502,16 +875,18 @@ func getVideoInfo(cfg Config, absPath string) (VideoInfo, error) {
 	}
 	infoCacheMu.Unlock()
 
-	cmd := exec.Command(cfg.FFprobePath, "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_type,codec_name,avg_frame_rate", "-of", "json", absPath)
+	cmd := exec.Command(cfg.FFprobePath, "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_type,codec_name,avg_frame_rate,channels,channel_layout", "-of", "json", absPath)
 	out, err := cmd.Output()
 	if err != nil {
 		return VideoInfo{}, err
 	}
 	var parsed struct {
 		Streams []struct {
-			CodecType    string `json:"codec_type"`
-			CodecName    string `json:"codec_name"`
-			AvgFrameRate string `json:"avg_frame_rate"`
+			CodecType     string `json:"codec_type"`
+			CodecName     string `json:"codec_name"`
+			AvgFrameRate  string `json:"avg_frame_rate"`
+			Channels      int    `json:"channels"`
+			ChannelLayout string `json:"channel_layout"`
 		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
@@ -532,6 +907,12 @@ func getVideoInfo(cfg Config, absPath string) (VideoInfo, error) {
 			info.HasAudio = true
 			if info.AudioCodec == "" {
 				info.AudioCodec = s.CodecName
+			}
+			if info.AudioCh == 0 {
+				info.AudioCh = s.Channels
+			}
+			if info.AudioLayout == "" {
+				info.AudioLayout = s.ChannelLayout
 			}
 		case "video":
 			if info.FPS == 0 && s.AvgFrameRate != "" {
@@ -571,6 +952,43 @@ func waitForFile(path string, timeout time.Duration) error {
 		}
 		time.Sleep(120 * time.Millisecond)
 	}
+}
+
+var bitrateRe = regexp.MustCompile(`^\d+(k|m|K|M)?$`)
+
+func parseBitrateParam(r *http.Request, def string) (string, error) {
+	v := strings.TrimSpace(r.URL.Query().Get("bitrate"))
+	if v == "" {
+		return def, nil
+	}
+	if !bitrateRe.MatchString(v) {
+		return "", fmt.Errorf("invalid bitrate")
+	}
+	return v, nil
+}
+
+func logLine(module, msg string) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	log.Printf("[%s][%s] %s", ts, module, msg)
+}
+
+func logSimple(cfg Config, module, format string, args ...interface{}) {
+	if !cfg.LogSimple && !cfg.LogDetail {
+		return
+	}
+	logLine(module, fmt.Sprintf(format, args...))
+}
+
+func logDetail(cfg Config, module, format string, args ...interface{}) {
+	if !cfg.LogDetail {
+		return
+	}
+	logLine(module, fmt.Sprintf(format, args...))
+}
+
+func fatalf(module, format string, args ...interface{}) {
+	logLine(module, fmt.Sprintf(format, args...))
+	os.Exit(1)
 }
 
 func playlistMetaPath(cacheDir string) string {
@@ -653,4 +1071,5 @@ func isHardwareEncoder(encoder string) bool {
 
 func init() {
 	flag.CommandLine.SetOutput(io.Discard)
+	log.SetFlags(0)
 }
