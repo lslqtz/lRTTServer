@@ -29,7 +29,7 @@ import (
 type Config struct {
 	Port            int
 	RuntimeDir      string
-	VideoDir        string
+	VideoDirs       []string
 	SegmentDuration int
 	Bitrate         string
 	AudioBitrate    string
@@ -108,21 +108,15 @@ type cachedInfo struct {
 func main() {
 	cfg := loadConfig()
 	logSimple(cfg, "MAIN", "runtime dir: %s", cfg.RuntimeDir)
-	logSimple(cfg, "MAIN", "video dir: %s", cfg.VideoDir)
+	logSimple(cfg, "MAIN", "video dirs: %s", strings.Join(cfg.VideoDirs, ", "))
 	logSimple(cfg, "MAIN", "segment duration: %ds", cfg.SegmentDuration)
 
-	if cfg.Encoder == "" || cfg.Encoder == "auto" {
-		enc, dec := detectHardware(cfg.FFmpegPath)
-		if enc != "" {
-			cfg.Encoder = enc
-		}
-		if dec != "" {
+	if cfg.Decoder == "" {
+		if dec := detectDecoder(cfg.FFmpegPath); dec != "" {
 			cfg.Decoder = dec
 		}
 	}
-	if cfg.Encoder == "" {
-		cfg.Encoder = "libx264"
-	}
+	cfg.Encoder = pickEncoder(cfg.Encoder, cfg.FFmpegPath)
 	logSimple(cfg, "MAIN", "encoder: %s decoder: %s", cfg.Encoder, cfg.Decoder)
 
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
@@ -194,11 +188,11 @@ func loadConfig() Config {
 	cfg := Config{
 		Port:            8082,
 		RuntimeDir:      runtimeDir,
-		VideoDir:        runtimeDir,
+		VideoDirs:       []string{runtimeDir},
 		SegmentDuration: 5,
 		Bitrate:         "4567k",
 		AudioBitrate:    "256k",
-		Encoder:         "auto",
+		Encoder:         "h265",
 		Decoder:         "",
 		FFmpegPath:      "ffmpeg",
 		FFprobePath:     "ffprobe",
@@ -218,7 +212,9 @@ func loadConfig() Config {
 
 	cfg.Port = envInt("RTT_PORT", cfg.Port)
 	cfg.RuntimeDir = envString("RTT_RUNTIME", cfg.RuntimeDir)
-	cfg.VideoDir = envString("RTT_VIDEO_DIR", cfg.VideoDir)
+	if v := envString("RTT_VIDEO_DIR", ""); v != "" {
+		cfg.VideoDirs = parseVideoDirs(v)
+	}
 	cfg.SegmentDuration = envInt("RTT_SEGMENT", cfg.SegmentDuration)
 	cfg.Bitrate = envString("RTT_BITRATE", cfg.Bitrate)
 	cfg.AudioBitrate = envString("RTT_AUDIO_BITRATE", cfg.AudioBitrate)
@@ -245,11 +241,7 @@ func loadConfig() Config {
 	cfg.LogSimple = envBool01("RTT_LOG_SIMPLE", cfg.LogSimple)
 	cfg.LogDetail = envBool01("RTT_LOG_DETAIL", cfg.LogDetail)
 
-	if cfg.VideoDir == "" {
-		cfg.VideoDir = cfg.RuntimeDir
-	} else if !filepath.IsAbs(cfg.VideoDir) {
-		cfg.VideoDir = filepath.Join(cfg.RuntimeDir, cfg.VideoDir)
-	}
+	cfg.VideoDirs = normalizeVideoDirs(cfg.RuntimeDir, cfg.VideoDirs)
 
 	cacheDir := envString("RTT_CACHE_DIR", cfg.CacheDir)
 	if cacheDir == "" {
@@ -284,6 +276,43 @@ func envBool01(key string, def bool) bool {
 	return def
 }
 
+func parseVideoDirs(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func normalizeVideoDirs(runtimeDir string, dirs []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		s := strings.TrimSpace(d)
+		if s == "" {
+			continue
+		}
+		if !filepath.IsAbs(s) {
+			s = filepath.Join(runtimeDir, s)
+		}
+		s = filepath.Clean(s)
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		out = []string{filepath.Clean(runtimeDir)}
+	}
+	return out
+}
+
 func readConfigFile(path string) (ConfigFile, bool, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -314,7 +343,7 @@ func applyConfigFile(cfg *Config, fileCfg ConfigFile) {
 		cfg.RuntimeDir = *fileCfg.RuntimeDir
 	}
 	if fileCfg.VideoDirPath != nil {
-		cfg.VideoDir = *fileCfg.VideoDirPath
+		cfg.VideoDirs = parseVideoDirs(*fileCfg.VideoDirPath)
 	}
 	if fileCfg.SegmentDuration != nil {
 		cfg.SegmentDuration = *fileCfg.SegmentDuration
@@ -386,7 +415,7 @@ func safeFilePath(baseDir, rel string) (string, error) {
 	return abs, nil
 }
 
-func safeDirPath(baseDir, rel string) (string, string, error) {
+func safeDirPathBase(baseDir, rel string) (string, string, error) {
 	clean := filepath.Clean(rel)
 	if clean == "." || clean == string(os.PathSeparator) {
 		clean = ""
@@ -421,6 +450,111 @@ func safeDirPath(baseDir, rel string) (string, string, error) {
 		relPath = ""
 	}
 	return abs, filepath.ToSlash(relPath), nil
+}
+
+func splitRootPrefix(rel string, roots int) (idx int, sub string, ok bool) {
+	parts := strings.SplitN(rel, "/", 2)
+	if len(parts) == 0 {
+		return 0, "", false
+	}
+	head := parts[0]
+	if len(head) < 2 || head[0] != 'r' {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(head[1:])
+	if err != nil || n < 0 || n >= roots {
+		return 0, "", false
+	}
+	if len(parts) == 2 {
+		return n, parts[1], true
+	}
+	return n, "", true
+}
+
+func resolveFilePath(cfg Config, rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return "", errors.New("empty path")
+	}
+	roots := cfg.VideoDirs
+	if len(roots) == 0 {
+		return "", errors.New("no video roots")
+	}
+	if len(roots) == 1 {
+		return safeFilePath(roots[0], rel)
+	}
+	if idx, sub, ok := splitRootPrefix(rel, len(roots)); ok {
+		return safeFilePath(roots[idx], sub)
+	}
+	var matched string
+	matchCount := 0
+	for _, root := range roots {
+		abs, err := safeFilePath(root, rel)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); err == nil {
+			matched = abs
+			matchCount++
+		}
+	}
+	if matchCount == 1 {
+		return matched, nil
+	}
+	if matchCount == 0 {
+		return "", errors.New("not found")
+	}
+	return "", errors.New("ambiguous path")
+}
+
+func resolveDirPath(cfg Config, rel string) (string, string, bool, error) {
+	rel = strings.TrimSpace(rel)
+	roots := cfg.VideoDirs
+	if len(roots) == 0 {
+		return "", "", false, errors.New("no video roots")
+	}
+	if len(roots) > 1 && rel == "" {
+		return "", "", true, nil
+	}
+	if len(roots) == 1 {
+		abs, relOut, err := safeDirPathBase(roots[0], rel)
+		return abs, relOut, false, err
+	}
+	if idx, sub, ok := splitRootPrefix(rel, len(roots)); ok {
+		abs, subRel, err := safeDirPathBase(roots[idx], sub)
+		if err != nil {
+			return "", "", false, err
+		}
+		relOut := fmt.Sprintf("r%d", idx)
+		if subRel != "" {
+			relOut = relOut + "/" + subRel
+		}
+		return abs, relOut, false, nil
+	}
+	var matchedAbs string
+	var matchedIdx int
+	matchCount := 0
+	for i, root := range roots {
+		abs, subRel, err := safeDirPathBase(root, rel)
+		if err != nil {
+			continue
+		}
+		_ = subRel
+		matchedAbs = abs
+		matchedIdx = i
+		matchCount++
+	}
+	if matchCount == 1 {
+		relOut := fmt.Sprintf("r%d", matchedIdx)
+		if rel != "" {
+			relOut = relOut + "/" + filepath.ToSlash(filepath.Clean(rel))
+		}
+		return matchedAbs, relOut, false, nil
+	}
+	if matchCount == 0 {
+		return "", "", false, errors.New("not found")
+	}
+	return "", "", false, errors.New("ambiguous dir")
 }
 
 func joinRel(relDir, name string) string {
@@ -468,7 +602,7 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	reqCfg := cfg
 	reqCfg.Bitrate = bitrate
-	absPath, err := safeFilePath(cfg.VideoDir, videoPath)
+	absPath, err := resolveFilePath(cfg, videoPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusForbidden)
 		return
@@ -515,7 +649,7 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	reqCfg := cfg
 	reqCfg.Bitrate = bitrate
-	absPath, err := safeFilePath(cfg.VideoDir, videoPath)
+	absPath, err := resolveFilePath(cfg, videoPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusForbidden)
 		return
@@ -544,9 +678,37 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 func handleBrowse(w http.ResponseWriter, r *http.Request, cfg Config) {
 	dirParam := strings.TrimSpace(r.URL.Query().Get("dir"))
-	absDir, relDir, err := safeDirPath(cfg.VideoDir, dirParam)
+	absDir, relDir, rootList, err := resolveDirPath(cfg, dirParam)
 	if err != nil {
 		http.Error(w, "invalid dir", http.StatusForbidden)
+		return
+	}
+	if rootList {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		var b strings.Builder
+		b.WriteString("<!doctype html><html><head><meta charset=\"utf-8\">")
+		b.WriteString("<title>Browse</title>")
+		b.WriteString("<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;margin:20px} ")
+		b.WriteString("a{text-decoration:none} .path{color:#666;margin-bottom:12px} ")
+		b.WriteString("ul{list-style:none;padding-left:0} li{margin:6px 0}</style>")
+		b.WriteString("</head><body>")
+		b.WriteString("<h2>Browse</h2>")
+		b.WriteString("<div class=\"path\">视频根目录</div>")
+		b.WriteString("<ul>")
+		for i, root := range cfg.VideoDirs {
+			label := root
+			base := filepath.Base(root)
+			if base != "" && base != "." && base != string(os.PathSeparator) {
+				label = base + " — " + root
+			}
+			b.WriteString("<li>📁 <a href=\"/browse?dir=")
+			b.WriteString(url.QueryEscape(fmt.Sprintf("r%d", i)))
+			b.WriteString("\">")
+			b.WriteString(htmlEscape(label))
+			b.WriteString("</a></li>")
+		}
+		b.WriteString("</ul></body></html>")
+		_, _ = w.Write([]byte(b.String()))
 		return
 	}
 	entries, err := os.ReadDir(absDir)
@@ -773,7 +935,7 @@ func buildFFmpegCommand(cfg Config, inputPath, cacheDir, playlistPath string, in
 		"-c:v", cfg.Encoder,
 		"-b:v", cfg.Bitrate,
 	)
-	if cfg.Encoder == "h264_videotoolbox" {
+	if strings.Contains(cfg.Encoder, "videotoolbox") {
 		args = append(args, "-allow_sw", "1")
 	}
 	if cfg.ForceKeyFrames {
@@ -985,8 +1147,7 @@ func markPlaylistDone(cacheDir string) error {
 	return os.WriteFile(playlistDonePath(cacheDir), []byte("ok\n"), 0o644)
 }
 
-func detectHardware(ffmpegPath string) (encoder string, decoder string) {
-	// decoder
+func detectDecoder(ffmpegPath string) (decoder string) {
 	if out, err := exec.Command(ffmpegPath, "-hide_banner", "-hwaccels").Output(); err == nil {
 		text := string(out)
 		if strings.Contains(text, "videotoolbox") {
@@ -999,25 +1160,53 @@ func detectHardware(ffmpegPath string) (encoder string, decoder string) {
 			decoder = "amf"
 		}
 	}
-	// encoder
-	if out, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").Output(); err == nil {
-		text := string(out)
-		if strings.Contains(text, "h264_videotoolbox") {
-			encoder = "h264_videotoolbox"
-		} else if strings.Contains(text, "h264_nvenc") {
-			encoder = "h264_nvenc"
-		} else if strings.Contains(text, "h264_qsv") {
-			encoder = "h264_qsv"
-		} else if strings.Contains(text, "h264_amf") {
-			encoder = "h264_amf"
+	return decoder
+}
+
+func availableEncoders(ffmpegPath string) map[string]bool {
+	out := map[string]bool{}
+	if data, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").Output(); err == nil {
+		text := string(data)
+		for _, enc := range []string{
+			"hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265",
+			"h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf", "libx264",
+		} {
+			if strings.Contains(text, enc) {
+				out[enc] = true
+			}
 		}
 	}
-	return encoder, decoder
+	return out
+}
+
+func pickEncoder(prefer string, ffmpegPath string) string {
+	p := strings.ToLower(strings.TrimSpace(prefer))
+	if p == "" || p == "auto" {
+		p = "h265"
+	}
+	avail := availableEncoders(ffmpegPath)
+	choose := func(candidates []string, fallback string) string {
+		for _, c := range candidates {
+			if avail[c] {
+				return c
+			}
+		}
+		return fallback
+	}
+	switch p {
+	case "h265", "hevc":
+		return choose([]string{"hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_amf"}, "libx265")
+	case "h264", "avc":
+		return choose([]string{"h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"}, "libx264")
+	default:
+		return prefer
+	}
 }
 
 func isHardwareEncoder(encoder string) bool {
 	switch encoder {
-	case "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf":
+	case "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf",
+		"hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_amf":
 		return true
 	default:
 		return false

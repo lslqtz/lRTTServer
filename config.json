@@ -1,0 +1,21 @@
+{
+  "port": 8082,
+  "runtime_dir": ".",
+  "videoDirPath": "./",
+  "segment": 5,
+  "bitrate": "4567k",
+  "audio_bitrate": "256k",
+  "encoder": "h265",
+  "decoder": "",
+  "ffmpeg": "ffmpeg",
+  "ffprobe": "ffprobe",
+  "max_jobs": 2,
+  "playlist_wait": 8,
+  "segment_wait": 30,
+  "audio_copy": false,
+  "force_keyframe": true,
+  "disable_scene_cut": true,
+  "log_ffmpeg_error": true,
+  "log_simple": true,
+  "log_detail": true
+}
