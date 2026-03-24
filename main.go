@@ -51,6 +51,11 @@ type Config struct {
 	BasicAuthUser   string
 	BasicAuthPass   string
 	BasicAuthOn     bool
+	SegmentByKey    bool
+	SegmentOnDemand bool
+	SegmentSeekAcc  bool
+	MaxKeyframeGap  int
+	ForceEncoder    bool
 }
 
 type ConfigFile struct {
@@ -77,6 +82,11 @@ type ConfigFile struct {
 	BasicAuthUser   *string `json:"basic_auth_user"`
 	BasicAuthPass   *string `json:"basic_auth_pass"`
 	BasicAuthOn     *bool   `json:"basic_auth_enabled"`
+	SegmentByKey    *bool   `json:"segment_by_keyframe"`
+	SegmentOnDemand *bool   `json:"segment_on_demand"`
+	SegmentSeekAcc  *bool   `json:"segment_seek_accurate"`
+	MaxKeyframeGap  *int    `json:"max_keyframe_interval"`
+	ForceEncoder    *bool   `json:"force_encoder"`
 }
 
 type VideoInfo struct {
@@ -85,6 +95,8 @@ type VideoInfo struct {
 	AudioCodec  string
 	AudioCh     int
 	AudioLayout string
+	VideoCodec  string
+	MaxKFGap    float64
 	FPS         float64
 }
 
@@ -105,11 +117,28 @@ var (
 
 	infoCache   = map[string]cachedInfo{}
 	infoCacheMu sync.Mutex
+
+	segJobs   = map[string]*job{}
+	segJobsMu sync.Mutex
+
+	segStats   = map[string]*segmentStat{}
+	segStatsMu sync.Mutex
+
+	hwDisableMu sync.Mutex
+	hwDisabled  = map[string]bool{}
 )
 
 type cachedInfo struct {
 	info VideoInfo
 	ts   time.Time
+}
+
+type segmentStat struct {
+	count int64
+	sumMs int64
+	maxMs int64
+	base  int64
+	last  int64
 }
 
 func main() {
@@ -124,6 +153,7 @@ func main() {
 		}
 	}
 	cfg.Encoder = pickEncoder(cfg.Encoder, cfg.FFmpegPath)
+	validateEncoder(&cfg)
 	logSimple(cfg, "MAIN", "encoder: %s decoder: %s", cfg.Encoder, cfg.Decoder)
 	if cfg.BasicAuthOn {
 		logSimple(cfg, "MAIN", "basic auth: enabled user=%s", cfg.BasicAuthUser)
@@ -221,6 +251,11 @@ func loadConfig() Config {
 		BasicAuthUser:   "",
 		BasicAuthPass:   "",
 		BasicAuthOn:     false,
+		SegmentByKey:    false,
+		SegmentOnDemand: true,
+		SegmentSeekAcc:  true,
+		MaxKeyframeGap:  0,
+		ForceEncoder:    false,
 	}
 	if found {
 		applyConfigFile(&cfg, fileCfg)
@@ -270,6 +305,11 @@ func loadConfig() Config {
 			fatalf("CONFIG", "basic auth enabled but user/pass missing")
 		}
 	}
+	cfg.SegmentByKey = envBool01("RTT_SEGMENT_BY_KEYFRAME", cfg.SegmentByKey)
+	cfg.SegmentOnDemand = envBool01("RTT_SEGMENT_ON_DEMAND", cfg.SegmentOnDemand)
+	cfg.SegmentSeekAcc = envBool01("RTT_SEGMENT_SEEK_ACCURATE", cfg.SegmentSeekAcc)
+	cfg.MaxKeyframeGap = envInt("RTT_MAX_KEYFRAME_INTERVAL", cfg.MaxKeyframeGap)
+	cfg.ForceEncoder = envBool01("RTT_FORCE_ENCODER", cfg.ForceEncoder)
 
 	cfg.VideoDirs = normalizeVideoDirs(cfg.RuntimeDir, cfg.VideoDirs)
 
@@ -434,6 +474,21 @@ func applyConfigFile(cfg *Config, fileCfg ConfigFile) {
 	}
 	if fileCfg.BasicAuthOn != nil {
 		cfg.BasicAuthOn = *fileCfg.BasicAuthOn
+	}
+	if fileCfg.SegmentByKey != nil {
+		cfg.SegmentByKey = *fileCfg.SegmentByKey
+	}
+	if fileCfg.SegmentOnDemand != nil {
+		cfg.SegmentOnDemand = *fileCfg.SegmentOnDemand
+	}
+	if fileCfg.SegmentSeekAcc != nil {
+		cfg.SegmentSeekAcc = *fileCfg.SegmentSeekAcc
+	}
+	if fileCfg.MaxKeyframeGap != nil {
+		cfg.MaxKeyframeGap = *fileCfg.MaxKeyframeGap
+	}
+	if fileCfg.ForceEncoder != nil {
+		cfg.ForceEncoder = *fileCfg.ForceEncoder
 	}
 }
 
@@ -655,6 +710,7 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "probe failed", http.StatusInternalServerError)
 		return
 	}
+	applySegmentMode(&reqCfg, info, true)
 	audioPart := "audio=none"
 	if info.HasAudio {
 		audioPart = fmt.Sprintf("audio=codec=%s ch=%d layout=%s", info.AudioCodec, info.AudioCh, info.AudioLayout)
@@ -663,13 +719,31 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request, cfg Config) {
 	logSimple(reqCfg, "PLAY", "playlist path=%s encoder=%s bitrate=%s %s %s", absPath, reqCfg.Encoder, reqCfg.Bitrate, videoPart, audioPart)
 	cacheDir := buildCacheDir(reqCfg, absPath, info)
 	playlistPath := filepath.Join(cacheDir, "index.m3u8")
-	ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
-	playlist := buildVODPlaylist(videoPath, info.Duration, reqCfg.SegmentDuration)
+	var playlist string
+	if reqCfg.SegmentOnDemand {
+		playlist = buildVODPlaylist(videoPath, info.Duration, reqCfg.SegmentDuration)
+	} else if reqCfg.SegmentByKey {
+		ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
+		if err := waitForFile(playlistPath, cfg.PlaylistWait); err != nil {
+			http.Error(w, "playlist not ready", http.StatusServiceUnavailable)
+			return
+		}
+		var err error
+		playlist, err = buildPlaylistFromFile(playlistPath, videoPath)
+		if err != nil {
+			http.Error(w, "playlist parse failed", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
+		playlist = buildVODPlaylist(videoPath, info.Duration, reqCfg.SegmentDuration)
+	}
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	_, _ = w.Write([]byte(playlist))
 }
 
 func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
+	reqStart := time.Now()
 	videoPath := r.URL.Query().Get("path")
 	segStr := r.URL.Query().Get("segment")
 	if videoPath == "" || segStr == "" {
@@ -702,17 +776,38 @@ func handleSegment(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "probe failed", http.StatusInternalServerError)
 		return
 	}
+	applySegmentMode(&reqCfg, info, false)
 	cacheDir := buildCacheDir(reqCfg, absPath, info)
 	playlistPath := filepath.Join(cacheDir, "index.m3u8")
-	ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
 	segmentPath := filepath.Join(cacheDir, fmt.Sprintf("seg_%05d.ts", seg))
 	logSimple(reqCfg, "PLAY.SEG", "segment=%d path=%s", seg, absPath)
-	if err := waitForFile(segmentPath, cfg.SegmentWait); err != nil {
-		http.Error(w, "segment not ready", http.StatusServiceUnavailable)
-		return
+	if reqCfg.SegmentOnDemand {
+		if err := ensureSegmentReady(reqCfg, absPath, cacheDir, segmentPath, seg, info); err != nil {
+			http.Error(w, "segment not ready", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		ensureHLSStarted(reqCfg, absPath, cacheDir, playlistPath, info)
+		if err := waitForFile(segmentPath, cfg.SegmentWait); err != nil {
+			http.Error(w, "segment not ready", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "video/MP2T")
-	serveFile(w, r, segmentPath)
+	tw := &ttfbWriter{
+		ResponseWriter: w,
+		start:          reqStart,
+		onFirstWrite: func(d time.Duration) {
+			base, avg, max, count := updateSegmentStats(reqCfg, absPath, d)
+			delta := d.Milliseconds() - base
+			deltaPct := 0.0
+			if base > 0 {
+				deltaPct = (float64(d.Milliseconds())/float64(base) - 1) * 100
+			}
+			logSimple(reqCfg, "PLAY.SEG", "segment=%d path=%s ttfb_ms=%d base_ms=%d avg_ms=%d max_ms=%d count=%d delta_ms=%d delta_pct=%.1f", seg, absPath, d.Milliseconds(), base, avg, max, count, delta, deltaPct)
+		},
+	}
+	serveFile(tw, r, segmentPath)
 }
 
 func handleBrowse(w http.ResponseWriter, r *http.Request, cfg Config) {
@@ -850,6 +945,143 @@ func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	_, _ = io.Copy(w, f)
 }
 
+func updateSegmentStats(cfg Config, absPath string, d time.Duration) (baseMs, avgMs, maxMs, count int64) {
+	key := buildSegmentStatsKey(cfg, absPath)
+	ms := d.Milliseconds()
+	segStatsMu.Lock()
+	defer segStatsMu.Unlock()
+	stat, ok := segStats[key]
+	if !ok {
+		stat = &segmentStat{}
+		segStats[key] = stat
+	}
+	stat.count++
+	stat.sumMs += ms
+	stat.last = ms
+	if stat.count == 1 {
+		stat.base = ms
+	}
+	if ms > stat.maxMs {
+		stat.maxMs = ms
+	}
+	baseMs = stat.base
+	avgMs = stat.sumMs / stat.count
+	maxMs = stat.maxMs
+	count = stat.count
+	return baseMs, avgMs, maxMs, count
+}
+
+func buildSegmentStatsKey(cfg Config, absPath string) string {
+	mode := "interval"
+	if cfg.SegmentOnDemand {
+		mode = "ondemand"
+	} else if cfg.SegmentByKey {
+		mode = "keyframe"
+	}
+	return fmt.Sprintf("%s|%s|%s|%d", absPath, cfg.Bitrate, mode, cfg.SegmentDuration)
+}
+
+func markHardwareDisabled(encoder string) {
+	if !isHardwareEncoder(encoder) {
+		return
+	}
+	hwDisableMu.Lock()
+	hwDisabled[encoder] = true
+	hwDisableMu.Unlock()
+}
+
+func applyHardwareFallback(cfg *Config, context string) {
+	if cfg.ForceEncoder {
+		return
+	}
+	if !isHardwareEncoder(cfg.Encoder) {
+		return
+	}
+	hwDisableMu.Lock()
+	disabled := hwDisabled[cfg.Encoder]
+	hwDisableMu.Unlock()
+	if !disabled {
+		return
+	}
+	cfg.Encoder = "libx264"
+	cfg.Decoder = ""
+	logSimple(*cfg, "FFMPEG", "hardware disabled, using libx264 (%s)", context)
+}
+
+func validateEncoder(cfg *Config) {
+	if cfg.ForceEncoder {
+		return
+	}
+	if !isHardwareEncoder(cfg.Encoder) {
+		return
+	}
+	if probeEncoder(cfg.FFmpegPath, cfg.Encoder) {
+		return
+	}
+	markHardwareDisabled(cfg.Encoder)
+	logSimple(*cfg, "FFMPEG", "hardware encoder unavailable: %s", cfg.Encoder)
+	if strings.HasPrefix(cfg.Encoder, "hevc_") {
+		alt := pickEncoder("h264", cfg.FFmpegPath)
+		if alt != "" && alt != "libx264" {
+			cfg.Encoder = alt
+			logSimple(*cfg, "FFMPEG", "switching to %s", cfg.Encoder)
+			return
+		}
+	}
+	cfg.Encoder = "libx264"
+	cfg.Decoder = ""
+	logSimple(*cfg, "FFMPEG", "switching to libx264")
+}
+
+func probeEncoder(ffmpegPath, encoder string) bool {
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-f", "lavfi",
+		"-i", "testsrc=size=128x72:rate=30",
+		"-t", "0.1",
+		"-c:v", encoder,
+		"-pix_fmt", "nv12",
+		"-f", "null",
+		"-",
+	}
+	cmd := exec.Command(ffmpegPath, args...)
+	return cmd.Run() == nil
+}
+
+type ttfbWriter struct {
+	http.ResponseWriter
+	start       time.Time
+	wroteFirst  bool
+	onFirstWrite func(time.Duration)
+}
+
+func (w *ttfbWriter) markFirstWrite() {
+	if w.wroteFirst {
+		return
+	}
+	w.wroteFirst = true
+	if w.onFirstWrite != nil {
+		w.onFirstWrite(time.Since(w.start))
+	}
+}
+
+func (w *ttfbWriter) WriteHeader(statusCode int) {
+	w.markFirstWrite()
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *ttfbWriter) Write(p []byte) (int, error) {
+	w.markFirstWrite()
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *ttfbWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func buildVODPlaylist(videoPath string, duration float64, segSeconds int) string {
 	if duration <= 0 {
 		duration = float64(segSeconds)
@@ -881,6 +1113,33 @@ func buildVODPlaylist(videoPath string, duration float64, segSeconds int) string
 	return b.String()
 }
 
+func buildPlaylistFromFile(playlistPath, videoPath string) (string, error) {
+	data, err := os.ReadFile(playlistPath)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	var b strings.Builder
+	segIndex := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			b.WriteString(line)
+			b.WriteString("\n")
+			continue
+		}
+		b.WriteString(fmt.Sprintf("/video/rttSegment?path=%s&segment=%d\n", url.QueryEscape(videoPath), segIndex))
+		segIndex++
+	}
+	if segIndex == 0 {
+		return "", errors.New("playlist has no segments")
+	}
+	return b.String(), nil
+}
+
 func buildCacheDir(cfg Config, absPath string, info VideoInfo) string {
 	stat, _ := os.Stat(absPath)
 	size := int64(0)
@@ -889,9 +1148,107 @@ func buildCacheDir(cfg Config, absPath string, info VideoInfo) string {
 		size = stat.Size()
 		mtime = stat.ModTime().UnixNano()
 	}
-	key := fmt.Sprintf("%s|%d|%d|%d|%s|%s|%t|%s", absPath, size, mtime, cfg.SegmentDuration, cfg.Bitrate, cfg.Encoder, cfg.PreferAudioCopy, info.AudioCodec)
+	key := fmt.Sprintf("%s|%d|%d|%d|%s|%s|%t|%t|%t|%s", absPath, size, mtime, cfg.SegmentDuration, cfg.Bitrate, cfg.Encoder, cfg.PreferAudioCopy, cfg.SegmentByKey, cfg.SegmentOnDemand, info.AudioCodec)
 	h := sha1.Sum([]byte(key))
 	return filepath.Join(cfg.CacheDir, hex.EncodeToString(h[:]))
+}
+
+func ensureSegmentReady(cfg Config, absPath, cacheDir, segmentPath string, segIndex int, info VideoInfo) error {
+	if st, err := os.Stat(segmentPath); err == nil {
+		if st.Size() > 0 {
+			return nil
+		}
+		_ = os.Remove(segmentPath)
+	}
+	segJobsMu.Lock()
+	if existing, ok := segJobs[segmentPath]; ok {
+		segJobsMu.Unlock()
+		<-existing.done
+		return existing.err
+	}
+	j := &job{done: make(chan struct{})}
+	segJobs[segmentPath] = j
+	segJobsMu.Unlock()
+
+	go func() {
+		defer close(j.done)
+		jobSem <- struct{}{}
+		defer func() { <-jobSem }()
+
+		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+			j.err = err
+			segJobsMu.Lock()
+			delete(segJobs, segmentPath)
+			segJobsMu.Unlock()
+			return
+		}
+		segDur := float64(cfg.SegmentDuration)
+		if segDur <= 0 {
+			segDur = 5
+		}
+		if info.Duration > 0 {
+			total := int(math.Ceil(info.Duration / segDur))
+			if segIndex >= total {
+				j.err = fmt.Errorf("segment out of range")
+				segJobsMu.Lock()
+				delete(segJobs, segmentPath)
+				segJobsMu.Unlock()
+				return
+			}
+		}
+		start := float64(segIndex) * segDur
+		duration := segDur
+		if info.Duration > 0 {
+			total := int(math.Ceil(info.Duration / segDur))
+			if segIndex == total-1 {
+				last := info.Duration - (segDur * float64(total-1))
+				if last > 0 {
+					duration = last
+				}
+			}
+		}
+
+		localCfg := cfg
+		applyHardwareFallback(&localCfg, "segment")
+		tmpPath := segmentPath + ".tmp"
+		args := buildFFmpegSegmentCommand(localCfg, absPath, tmpPath, start, duration, info)
+		logDetail(cfg, "FFMPEG", "seg cmd: %s %s", cfg.FFmpegPath, strings.Join(args, " "))
+		err := runFFmpeg(localCfg, args)
+		if err != nil && !localCfg.SegmentByKey && isHardwareEncoder(localCfg.Encoder) && localCfg.Decoder != "" {
+			_ = os.Remove(tmpPath)
+			logSimple(cfg, "FFMPEG", "segment hw decode failed, retrying with software decode: %v", err)
+			fallback := localCfg
+			fallback.Decoder = ""
+			args = buildFFmpegSegmentCommand(fallback, absPath, tmpPath, start, duration, info)
+			logDetail(fallback, "FFMPEG", "seg cmd: %s %s", fallback.FFmpegPath, strings.Join(args, " "))
+			err = runFFmpeg(fallback, args)
+		}
+		if !localCfg.ForceEncoder && err != nil && !localCfg.SegmentByKey && isHardwareEncoder(localCfg.Encoder) {
+			_ = os.Remove(tmpPath)
+			markHardwareDisabled(localCfg.Encoder)
+			logSimple(cfg, "FFMPEG", "segment hw failed, retrying with libx264: %v", err)
+			fallback := localCfg
+			fallback.Encoder = "libx264"
+			fallback.Decoder = ""
+			args = buildFFmpegSegmentCommand(fallback, absPath, tmpPath, start, duration, info)
+			logDetail(fallback, "FFMPEG", "seg cmd: %s %s", fallback.FFmpegPath, strings.Join(args, " "))
+			err = runFFmpeg(fallback, args)
+		}
+		if err == nil {
+			if renameErr := os.Rename(tmpPath, segmentPath); renameErr != nil {
+				err = renameErr
+			}
+		} else {
+			_ = os.Remove(tmpPath)
+		}
+		j.err = err
+		segJobsMu.Lock()
+		delete(segJobs, segmentPath)
+		segJobsMu.Unlock()
+	}()
+
+	<-j.done
+	return j.err
 }
 
 func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info VideoInfo) {
@@ -904,14 +1261,15 @@ func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info V
 	jobs[cacheDir] = j
 	jobsMu.Unlock()
 
-	go func() {
-		defer close(j.done)
-		jobSem <- struct{}{}
-		defer func() { <-jobSem }()
+		go func() {
+			defer close(j.done)
+			jobSem <- struct{}{}
+			defer func() { <-jobSem }()
 
-		logSimple(cfg, "FFMPEG", "start path=%s encoder=%s bitrate=%s", absPath, cfg.Encoder, cfg.Bitrate)
-		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-			j.err = err
+			applyHardwareFallback(&cfg, "hls")
+			logSimple(cfg, "FFMPEG", "start path=%s encoder=%s bitrate=%s", absPath, cfg.Encoder, cfg.Bitrate)
+			if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+				j.err = err
 			jobsMu.Lock()
 			delete(jobs, cacheDir)
 			jobsMu.Unlock()
@@ -924,23 +1282,37 @@ func ensureHLSStarted(cfg Config, absPath, cacheDir, playlistPath string, info V
 		})
 		cmd := buildFFmpegCommand(cfg, absPath, cacheDir, playlistPath, info)
 		logDetail(cfg, "FFMPEG", "cmd: %s %s", cfg.FFmpegPath, strings.Join(cmd, " "))
-		if err := runFFmpeg(cfg, cmd); err != nil {
-			if isHardwareEncoder(cfg.Encoder) {
-				logSimple(cfg, "FFMPEG", "hardware failed, retrying with libx264: %v", err)
-				fallback := cfg
-				fallback.Encoder = "libx264"
-				cmd = buildFFmpegCommand(fallback, absPath, cacheDir, playlistPath, info)
-				logDetail(fallback, "FFMPEG", "cmd: %s %s", fallback.FFmpegPath, strings.Join(cmd, " "))
-				if err2 := runFFmpeg(fallback, cmd); err2 == nil {
-					logSimple(fallback, "FFMPEG", "done (fallback): %s", absPath)
-					return
-				} else {
-					err = err2
+			if err := runFFmpeg(cfg, cmd); err != nil {
+				if !cfg.SegmentByKey && isHardwareEncoder(cfg.Encoder) && cfg.Decoder != "" {
+					logSimple(cfg, "FFMPEG", "hardware decode failed, retrying with software decode: %v", err)
+					fallback := cfg
+					fallback.Decoder = ""
+					cmd = buildFFmpegCommand(fallback, absPath, cacheDir, playlistPath, info)
+					logDetail(fallback, "FFMPEG", "cmd: %s %s", fallback.FFmpegPath, strings.Join(cmd, " "))
+					if err2 := runFFmpeg(fallback, cmd); err2 == nil {
+						logSimple(fallback, "FFMPEG", "done (fallback): %s", absPath)
+						return
+					} else {
+						err = err2
+					}
 				}
-			}
-			j.err = err
-			jobsMu.Lock()
-			delete(jobs, cacheDir)
+				if !cfg.ForceEncoder && !cfg.SegmentByKey && isHardwareEncoder(cfg.Encoder) {
+					markHardwareDisabled(cfg.Encoder)
+					logSimple(cfg, "FFMPEG", "hardware failed, retrying with libx264: %v", err)
+					fallback := cfg
+					fallback.Encoder = "libx264"
+					cmd = buildFFmpegCommand(fallback, absPath, cacheDir, playlistPath, info)
+					logDetail(fallback, "FFMPEG", "cmd: %s %s", fallback.FFmpegPath, strings.Join(cmd, " "))
+					if err2 := runFFmpeg(fallback, cmd); err2 == nil {
+						logSimple(fallback, "FFMPEG", "done (fallback): %s", absPath)
+						return
+					} else {
+						err = err2
+					}
+				}
+				j.err = err
+				jobsMu.Lock()
+				delete(jobs, cacheDir)
 			jobsMu.Unlock()
 			logSimple(cfg, "FFMPEG", "failed: %v", err)
 			return
@@ -970,24 +1342,34 @@ func buildFFmpegCommand(cfg Config, inputPath, cacheDir, playlistPath string, in
 		args = append(args, "-hwaccel", cfg.Decoder)
 	}
 	args = append(args, "-i", inputPath)
-	args = append(args,
-		"-c:v", cfg.Encoder,
-		"-b:v", cfg.Bitrate,
-	)
-	if strings.Contains(cfg.Encoder, "videotoolbox") {
-		args = append(args, "-allow_sw", "1")
-	}
-	if cfg.ForceKeyFrames {
-		args = append(args, "-flags", "+cgop")
-		args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentDuration))
-	}
-	if cfg.DisableSceneCut {
-		args = append(args, "-sc_threshold", "0")
-	}
-	if info.FPS > 0 {
-		gop := int(math.Round(info.FPS * float64(cfg.SegmentDuration)))
-		if gop > 0 {
-			args = append(args, "-g", strconv.Itoa(gop), "-keyint_min", strconv.Itoa(gop))
+	if cfg.SegmentByKey {
+		args = append(args, "-c:v", "copy")
+		if bsf := annexBFilter(info.VideoCodec); bsf != "" {
+			args = append(args, "-bsf:v", bsf)
+		}
+	} else {
+		args = append(args,
+			"-c:v", cfg.Encoder,
+			"-b:v", cfg.Bitrate,
+		)
+		if strings.Contains(cfg.Encoder, "videotoolbox") {
+			args = append(args, "-allow_sw", "1")
+			args = append(args, "-pix_fmt", "nv12")
+		}
+		if !isHardwareEncoder(cfg.Encoder) {
+			if cfg.ForceKeyFrames {
+				args = append(args, "-flags", "+cgop")
+				args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentDuration))
+			}
+			if cfg.DisableSceneCut {
+				args = append(args, "-sc_threshold", "0")
+			}
+		}
+		if info.FPS > 0 {
+			gop := int(math.Round(info.FPS * float64(cfg.SegmentDuration)))
+			if gop > 0 {
+				args = append(args, "-g", strconv.Itoa(gop), "-keyint_min", strconv.Itoa(gop))
+			}
 		}
 	}
 
@@ -1017,6 +1399,83 @@ func buildFFmpegCommand(cfg Config, inputPath, cacheDir, playlistPath string, in
 		"-hls_segment_filename", segPattern,
 		"-start_number", "0",
 		playlistPath,
+	)
+	return args
+}
+
+func buildFFmpegSegmentCommand(cfg Config, inputPath, outputPath string, startSec, durSec float64, info VideoInfo) []string {
+	coarse := startSec
+	fine := 0.0
+	if cfg.SegmentSeekAcc {
+		coarse = math.Floor(startSec)
+		if coarse < 0 {
+			coarse = 0
+		}
+		fine = startSec - coarse
+		if fine < 0 {
+			fine = 0
+		}
+	}
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-ss", formatSeconds(coarse),
+	}
+	if cfg.Decoder != "" {
+		args = append(args, "-hwaccel", cfg.Decoder)
+	}
+	args = append(args, "-i", inputPath)
+	if cfg.SegmentSeekAcc {
+		args = append(args, "-ss", formatSeconds(fine))
+	}
+	args = append(args, "-t", formatSeconds(durSec))
+	if cfg.SegmentByKey {
+		args = append(args, "-c:v", "copy")
+		if bsf := annexBFilter(info.VideoCodec); bsf != "" {
+			args = append(args, "-bsf:v", bsf)
+		}
+	} else {
+		args = append(args,
+			"-c:v", cfg.Encoder,
+			"-b:v", cfg.Bitrate,
+		)
+		if strings.Contains(cfg.Encoder, "videotoolbox") {
+			args = append(args, "-allow_sw", "1")
+			//args = append(args, "-pix_fmt", "nv12")
+		}
+		if !isHardwareEncoder(cfg.Encoder) {
+			if cfg.ForceKeyFrames {
+				args = append(args, "-flags", "+cgop")
+				args = append(args, "-force_key_frames", "0")
+			}
+			if cfg.DisableSceneCut {
+				args = append(args, "-sc_threshold", "0")
+			}
+		}
+	}
+
+	if info.HasAudio {
+		if cfg.PreferAudioCopy && info.AudioCodec == "aac" {
+			args = append(args, "-c:a", "copy")
+		} else {
+			args = append(args, "-c:a", "aac", "-b:a", cfg.AudioBitrate, "-af", "aresample=async=1:min_hard_comp=0.1:first_pts=0")
+			if info.AudioCh > 0 {
+				args = append(args, "-ac", strconv.Itoa(info.AudioCh))
+			}
+			if info.AudioLayout != "" {
+				args = append(args, "-channel_layout", info.AudioLayout)
+			}
+		}
+	} else {
+		args = append(args, "-an")
+	}
+
+	args = append(args,
+		"-avoid_negative_ts", "make_zero",
+		"-reset_timestamps", "1",
+		"-f", "mpegts",
+		outputPath,
 	)
 	return args
 }
@@ -1071,10 +1530,16 @@ func getVideoInfo(cfg Config, absPath string) (VideoInfo, error) {
 				info.AudioLayout = s.ChannelLayout
 			}
 		case "video":
+			if info.VideoCodec == "" {
+				info.VideoCodec = s.CodecName
+			}
 			if info.FPS == 0 && s.AvgFrameRate != "" {
 				info.FPS = parseRational(s.AvgFrameRate)
 			}
 		}
+	}
+	if cfg.MaxKeyframeGap > 0 {
+		info.MaxKFGap = probeMaxKeyframeGap(cfg, absPath)
 	}
 	infoCacheMu.Lock()
 	infoCache[absPath] = cachedInfo{info: info, ts: time.Now()}
@@ -1093,6 +1558,101 @@ func parseRational(v string) float64 {
 		return 0
 	}
 	return n / d
+}
+
+func formatSeconds(v float64) string {
+	if v < 0 {
+		v = 0
+	}
+	return fmt.Sprintf("%.3f", v)
+}
+
+func applySegmentByKey(cfg *Config, info VideoInfo, emitLog bool) {
+	if !cfg.SegmentByKey {
+		return
+	}
+	if isKeyframeCopyCodec(info.VideoCodec) {
+		return
+	}
+	if emitLog {
+		logSimple(*cfg, "PLAY", "segment_by_keyframe disabled codec=%s", info.VideoCodec)
+	}
+	cfg.SegmentByKey = false
+}
+
+func applySegmentMode(cfg *Config, info VideoInfo, emitLog bool) {
+	if cfg.MaxKeyframeGap > 0 && info.MaxKFGap > float64(cfg.MaxKeyframeGap) {
+		if emitLog {
+			logSimple(*cfg, "PLAY", "max_keyframe_interval exceeded gap=%.3fs limit=%ds -> keyframe mode", info.MaxKFGap, cfg.MaxKeyframeGap)
+		}
+		cfg.SegmentOnDemand = false
+		cfg.SegmentByKey = true
+	}
+	if cfg.SegmentOnDemand && cfg.SegmentByKey {
+		if emitLog {
+			logSimple(*cfg, "PLAY", "segment_by_keyframe disabled for on_demand")
+		}
+		cfg.SegmentByKey = false
+	}
+	applySegmentByKey(cfg, info, emitLog)
+}
+
+func isKeyframeCopyCodec(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "h264", "avc1", "hevc", "h265", "hev1":
+		return true
+	default:
+		return false
+	}
+}
+
+func annexBFilter(codec string) string {
+	switch strings.ToLower(codec) {
+	case "h264", "avc1":
+		return "h264_mp4toannexb"
+	case "hevc", "h265", "hev1":
+		return "hevc_mp4toannexb"
+	default:
+		return ""
+	}
+}
+
+func probeMaxKeyframeGap(cfg Config, absPath string) float64 {
+	cmd := exec.Command(cfg.FFprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-skip_frame", "nokey",
+		"-show_entries", "frame=pkt_pts_time",
+		"-of", "csv=p=0",
+		absPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(string(out), "\n")
+	var prevSet bool
+	var prev float64
+	var maxGap float64
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(line, 64)
+		if err != nil {
+			continue
+		}
+		if prevSet {
+			gap := v - prev
+			if gap > maxGap {
+				maxGap = gap
+			}
+		}
+		prev = v
+		prevSet = true
+	}
+	return maxGap
 }
 
 func waitForFile(path string, timeout time.Duration) error {
